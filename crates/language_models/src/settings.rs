@@ -182,6 +182,7 @@ impl settings::Settings for AllLanguageModelSettings {
                         OpenAiCompatibleSettings {
                             api_url: value.api_url,
                             available_models: value.available_models,
+                            input_token_count: value.input_token_count,
                             custom_headers: custom_headers_from(
                                 &provider_label,
                                 value.custom_headers,

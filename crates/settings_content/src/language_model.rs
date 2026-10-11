@@ -425,6 +425,26 @@ pub struct OpenAiCompatibleSettingsContent {
     pub api_url: String,
     pub available_models: Vec<OpenAiCompatibleAvailableModel>,
     pub custom_headers: Option<HashMap<String, String>>,
+    pub input_token_count: Option<OpenAiCompatibleInputTokenCountSettings>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct OpenAiCompatibleInputTokenCountSettings {
+    pub protocol: OpenAiCompatibleInputTokenCountProtocol,
+    pub api_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiCompatibleInputTokenCountProtocol {
+    Vllm,
+}
+
+impl MergeFrom for OpenAiCompatibleInputTokenCountProtocol {
+    fn merge_from(&mut self, other: &Self) {
+        *self = other.clone();
+    }
 }
 
 #[with_fallible_options]

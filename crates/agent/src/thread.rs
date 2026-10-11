@@ -2846,81 +2846,21 @@ impl Thread {
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<LanguageModel> = None;
         loop {
-            match Self::perform_compaction_if_needed(
+            match Self::perform_auto_compaction_if_needed(
                 this,
                 event_stream,
                 cancellation_rx.clone(),
+                false,
+                &mut attempt,
                 cx,
             )
             .await
             {
-                // On success the telemetry event is deferred until the
-                // completion below reports usage, so we can record an
-                // accurate post-compaction context size (see
-                // `handle_completion_event`).
                 Ok(ControlFlow::Continue(())) => {}
                 Ok(ControlFlow::Break(())) => {
-                    this.update(cx, |this, _| {
-                        this.emit_compaction_telemetry_outcome("canceled", None)
-                    })?;
                     return Ok(());
                 }
-                Err(error) => {
-                    log::error!("Compaction failed: {}", error);
-                    let error_message = error.to_string();
-                    match error.downcast::<LanguageModelCompletionError>() {
-                        Ok(error) => {
-                            attempt += 1;
-                            match Self::retry_completion_error(
-                                this,
-                                event_stream,
-                                &mut cancellation_rx,
-                                error,
-                                attempt,
-                                cx,
-                            )
-                            .await
-                            {
-                                Ok(ControlFlow::Break(())) => {
-                                    this.update(cx, |this, _| {
-                                        this.emit_compaction_telemetry_outcome("canceled", None)
-                                    })?;
-                                    return Ok(());
-                                }
-                                Ok(ControlFlow::Continue(())) => {
-                                    this.update(cx, |this, _| {
-                                        if let Some(telemetry) =
-                                            this.pending_compaction_telemetry.as_mut()
-                                        {
-                                            telemetry.retries += 1;
-                                        }
-                                    })?;
-                                    continue;
-                                }
-                                Err(retry_error) => {
-                                    this.update(cx, |this, _| {
-                                        this.emit_compaction_telemetry_outcome(
-                                            "failed",
-                                            Some(error_message),
-                                        )
-                                    })?;
-                                    return Err(
-                                        retry_error.context("Automatic context compaction failed")
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            this.update(cx, |this, _| {
-                                this.emit_compaction_telemetry_outcome(
-                                    "failed",
-                                    Some(error_message),
-                                )
-                            })?;
-                            return Err(error.context("Automatic context compaction failed"));
-                        }
-                    }
-                }
+                Err(error) => return Err(error),
             }
 
             // Re-read the model and refresh tools on each iteration so that
@@ -2938,6 +2878,45 @@ impl Thread {
                 this.current_request_token_usage = TokenUsage::default();
                 anyhow::Ok((model, provider, request))
             })??;
+
+            let preflight_requires_compaction = match (
+                &provider,
+                this.read_with(cx, |this, cx| {
+                    this.auto_compaction_enabled(cx)
+                        .then(|| this.input_token_capacity())
+                        .flatten()
+                })?,
+            ) {
+                (Ok(provider), Some(input_capacity)) => match provider
+                    .count_input_tokens(&model, request.clone(), cx)
+                    .await
+                {
+                    Ok(Some(input_tokens)) => input_tokens > input_capacity,
+                    Ok(None) => false,
+                    Err(error) => {
+                        log::warn!("Could not count input tokens before completion: {error}");
+                        false
+                    }
+                },
+                _ => false,
+            };
+
+            if preflight_requires_compaction {
+                match Self::perform_auto_compaction_if_needed(
+                    this,
+                    event_stream,
+                    cancellation_rx.clone(),
+                    true,
+                    &mut attempt,
+                    cx,
+                )
+                .await
+                {
+                    Ok(ControlFlow::Continue(())) => continue,
+                    Ok(ControlFlow::Break(())) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
 
             telemetry::event!(
                 "Agent Thread Completion",
@@ -3225,14 +3204,97 @@ impl Thread {
         Ok(ControlFlow::Continue(()))
     }
 
+    async fn perform_auto_compaction_if_needed(
+        this: &WeakEntity<Self>,
+        event_stream: &ThreadEventStream,
+        mut cancellation_rx: watch::Receiver<bool>,
+        force: bool,
+        attempt: &mut u8,
+        cx: &mut AsyncApp,
+    ) -> Result<ControlFlow<()>> {
+        loop {
+            match Self::perform_compaction_if_needed(
+                this,
+                event_stream,
+                cancellation_rx.clone(),
+                force,
+                cx,
+            )
+            .await
+            {
+                // On success the telemetry event is deferred until the
+                // completion below reports usage, so we can record an accurate
+                // post-compaction context size (see `handle_completion_event`).
+                Ok(control_flow) => return Ok(control_flow),
+                Err(error) => {
+                    log::error!("Compaction failed: {}", error);
+                    let error_message = error.to_string();
+                    match error.downcast::<LanguageModelCompletionError>() {
+                        Ok(error) => {
+                            *attempt += 1;
+                            match Self::retry_completion_error(
+                                this,
+                                event_stream,
+                                &mut cancellation_rx,
+                                error,
+                                *attempt,
+                                cx,
+                            )
+                            .await
+                            {
+                                Ok(ControlFlow::Break(())) => {
+                                    this.update(cx, |this, _| {
+                                        this.emit_compaction_telemetry_outcome("canceled", None)
+                                    })?;
+                                    return Ok(ControlFlow::Break(()));
+                                }
+                                Ok(ControlFlow::Continue(())) => {
+                                    this.update(cx, |this, _| {
+                                        if let Some(telemetry) =
+                                            this.pending_compaction_telemetry.as_mut()
+                                        {
+                                            telemetry.retries += 1;
+                                        }
+                                    })?;
+                                    continue;
+                                }
+                                Err(retry_error) => {
+                                    this.update(cx, |this, _| {
+                                        this.emit_compaction_telemetry_outcome(
+                                            "failed",
+                                            Some(error_message),
+                                        )
+                                    })?;
+                                    return Err(
+                                        retry_error.context("Automatic context compaction failed")
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            this.update(cx, |this, _| {
+                                this.emit_compaction_telemetry_outcome(
+                                    "failed",
+                                    Some(error_message),
+                                )
+                            })?;
+                            return Err(error.context("Automatic context compaction failed"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn perform_compaction_if_needed(
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
         cancellation_rx: watch::Receiver<bool>,
+        force: bool,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
-        let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
-            let insertion_ix = this.compaction_message_target_ix(cx)?;
+        let Some((model, mut request, insertion_ix)) = this.update(cx, |this, cx| {
+            let insertion_ix = this.compaction_message_target_ix_with_force(force, cx)?;
             let model = this.compaction_model(cx)?;
             let request = this.build_compaction_request(insertion_ix, &model, cx);
             this.current_request_token_usage = TokenUsage::default();
@@ -3247,6 +3309,37 @@ impl Thread {
         else {
             return Ok(ControlFlow::Continue(()));
         };
+
+        let provider =
+            cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
+        match provider
+            .count_input_tokens(&model, request.clone(), cx)
+            .await
+        {
+            Ok(Some(input_tokens)) => {
+                if input_tokens > model.max_input_tokens() {
+                    return Err(anyhow!(
+                        "Compaction input exceeds the model input limit ({} tokens)",
+                        model.max_input_tokens()
+                    ));
+                }
+                let available_output_tokens = model.max_token_count().saturating_sub(input_tokens);
+                if available_output_tokens == 0 {
+                    return Err(anyhow!(
+                        "Compaction input exceeds the model context window ({} tokens)",
+                        model.max_token_count()
+                    ));
+                }
+                request.max_output_tokens = Some(
+                    request
+                        .max_output_tokens
+                        .unwrap_or_default()
+                        .min(available_output_tokens),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("Could not count input tokens before compaction: {error}"),
+        }
 
         Self::stream_compaction(
             this,
@@ -4538,7 +4631,12 @@ impl Thread {
         }
     }
 
+    #[cfg(test)]
     fn compaction_message_target_ix(&self, cx: &App) -> Option<usize> {
+        self.compaction_message_target_ix_with_force(false, cx)
+    }
+
+    fn compaction_message_target_ix_with_force(&self, force: bool, cx: &App) -> Option<usize> {
         if !self.auto_compaction_enabled(cx) {
             return None;
         }
@@ -4570,7 +4668,7 @@ impl Thread {
         let active_tokens = total_input_tokens(usage).saturating_add(usage.output_tokens);
         let compaction_threshold =
             auto_compact_threshold_token_count(auto_compact.threshold, max_input_tokens);
-        if active_tokens < compaction_threshold {
+        if !force && active_tokens < compaction_threshold {
             return None;
         }
 
@@ -8387,6 +8485,62 @@ mod tests {
         fake.send_text(&compaction_model, &request, "summary");
         fake.end_stream(&compaction_model, &request);
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_auto_compaction_accounts_for_pending_request_tokens(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = 122_880;
+            model.max_input_tokens = 122_880;
+            model.max_output_tokens = Some(24_576);
+        });
+        let old_user_message_id = ClientUserMessageId::new();
+
+        fake.queue_input_token_count(98_305);
+        fake.queue_input_token_count(118_785);
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(old_user_message_id.clone(), "old user"));
+                thread.messages.push(agent_text_message("old assistant"));
+                thread.request_token_usage.insert(
+                    old_user_message_id,
+                    TokenUsage {
+                        input_tokens: 80_000,
+                        ..Default::default()
+                    },
+                );
+            });
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: agent_settings::AutoCompactThreshold::Percentage(0.9),
+                },
+            );
+        });
+
+        let _events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), vec!["large prompt"], cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let request = fake
+            .pending_completions()
+            .pop()
+            .expect("pending input tokens should trigger auto-compaction");
+        assert_eq!(
+            request.intent,
+            Some(CompletionIntent::ThreadContextSummarization)
+        );
+        assert_eq!(request.max_output_tokens, Some(4_095));
     }
 
     #[gpui::test]
