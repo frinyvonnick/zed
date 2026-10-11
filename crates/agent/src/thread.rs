@@ -124,6 +124,11 @@ pub enum SandboxStatusRefresh {
 /// the user instead.
 pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
 
+// A compaction needs a short summary, not a full agent response. Keeping this
+// independent from the model's normal output budget lets a nearly-full context
+// still be compacted.
+const MAX_COMPACTION_OUTPUT_TOKENS: u64 = 4_096;
+
 // Using the heuristic that 1 token is about 4 bytes, keep the last 80K bytes of user-message content (~20k tokens).
 const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 
@@ -4612,6 +4617,7 @@ impl Thread {
             prompt_id: Some(self.prompt_id.to_string()),
             intent: Some(CompletionIntent::ThreadContextSummarization),
             temperature: AgentSettings::temperature_for_model(&model, cx),
+            max_output_tokens: Some(MAX_COMPACTION_OUTPUT_TOKENS),
             messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
             ..Default::default()
         };

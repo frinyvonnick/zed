@@ -4464,6 +4464,7 @@ mod internal_tests {
             request.intent,
             Some(CompletionIntent::ThreadContextSummarization)
         );
+        assert_eq!(request.max_output_tokens, Some(4_096));
         assert_eq!(
             request_texts_after_system(&request.messages),
             vec![
@@ -4722,6 +4723,7 @@ mod internal_tests {
             first_compaction_request.intent,
             Some(CompletionIntent::ThreadContextSummarization)
         );
+        assert_eq!(first_compaction_request.max_output_tokens, Some(4_096));
         fake.send_error(
             &model,
             &first_compaction_request,
