@@ -2,7 +2,7 @@ use anyhow::Result;
 use credentials_provider::CredentialsProvider;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use gpui::{App, AppContext, AsyncApp, Entity, Task};
-use http_client::{CustomHeaders, HttpClient};
+use http_client::{AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest};
 use language_model::chat_completion::ChatCompletionEventMapper;
 use language_model::{
     AuthenticateError, IconOrSvg, LanguageModel, LanguageModelClient, LanguageModelCompletionError,
@@ -17,6 +17,7 @@ use open_ai::{
     responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
     stream_completion,
 };
+use serde::Deserialize;
 use settings::Settings;
 use std::sync::Arc;
 use ui::IconName;
@@ -27,6 +28,8 @@ use crate::provider::api_compatible::{
 };
 use crate::provider::open_ai::{OpenAiResponseEventMapper, into_open_ai, into_open_ai_response};
 pub use settings::OpenAiCompatibleAvailableModel as AvailableModel;
+pub use settings::OpenAiCompatibleInputTokenCountProtocol as InputTokenCountProtocol;
+pub use settings::OpenAiCompatibleInputTokenCountSettings as InputTokenCountSettings;
 pub use settings::OpenAiCompatibleModelCapabilities as ModelCapabilities;
 
 const API_KEY_PLACEHOLDER: &str = "000000000000000000000000000000000000000000000000000";
@@ -36,6 +39,7 @@ pub struct OpenAiCompatibleSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
     pub custom_headers: CustomHeaders,
+    pub input_token_count: Option<InputTokenCountSettings>,
 }
 
 impl ApiCompatibleProviderSettings for OpenAiCompatibleSettings {
@@ -350,6 +354,77 @@ impl LanguageModelClient for OpenAiCompatibleLanguageModelProvider {
             }
             .boxed()
         }
+    }
+
+    fn count_input_tokens(
+        &self,
+        model: &LanguageModel,
+        mut request: LanguageModelRequest,
+        cx: &AsyncApp,
+    ) -> BoxFuture<'static, Result<Option<u64>, LanguageModelCompletionError>> {
+        let config = match cx.update(|cx| self.config(model, cx)) {
+            Ok(config) => config,
+            Err(error) => return async move { Err(error) }.boxed(),
+        };
+        let Some(token_count) = self
+            .state
+            .read_with(cx, |state, _| state.settings.input_token_count.clone())
+        else {
+            return async { Ok(None) }.boxed();
+        };
+        if !config.capabilities.chat_completions {
+            return async { Ok(None) }.boxed();
+        }
+
+        request.speed = None;
+        let reasoning_effort = chat_completion_reasoning_effort(&request, &config);
+        let request = match into_open_ai(
+            request,
+            &config.name,
+            config.capabilities.parallel_tool_calls,
+            config.capabilities.prompt_cache_key,
+            config.max_output_tokens,
+            chat_completion_max_tokens_parameter(&config),
+            reasoning_effort,
+            config.capabilities.interleaved_reasoning,
+        ) {
+            Ok(request) => request,
+            Err(error) => return async move { Err(error.into()) }.boxed(),
+        };
+
+        let http_client = self.http_client.clone();
+        let provider = self.name.clone();
+        let future = async move {
+            match token_count.protocol {
+                InputTokenCountProtocol::Vllm => {
+                    #[derive(Deserialize)]
+                    struct VllmTokenizeResponse {
+                        count: u64,
+                    }
+
+                    let request = HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri(&token_count.api_url)
+                        .header("Content-Type", "application/json")
+                        .body(AsyncBody::from(serde_json::to_string(&request)?))?;
+                    let mut response = http_client.send(request).await?;
+                    let mut body = String::new();
+                    futures::AsyncReadExt::read_to_string(response.body_mut(), &mut body).await?;
+                    if !response.status().is_success() {
+                        return Err(anyhow::anyhow!(
+                            "{} input token count failed with status {}: {}",
+                            provider.0,
+                            response.status(),
+                            body
+                        ));
+                    }
+                    Ok(Some(
+                        serde_json::from_str::<VllmTokenizeResponse>(&body)?.count,
+                    ))
+                }
+            }
+        };
+        async move { future.await.map_err(Into::into) }.boxed()
     }
 }
 

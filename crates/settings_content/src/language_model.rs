@@ -142,7 +142,24 @@ pub struct BedrockAvailableModel {
     pub max_output_tokens: Option<u64>,
     #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub default_temperature: Option<f32>,
-    pub mode: Option<ModelMode>,
+    pub supports_tools: Option<bool>,
+    pub supports_images: Option<bool>,
+    pub thinking: Option<BedrockThinkingSettings>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(untagged)]
+pub enum BedrockThinkingSettings {
+    Enabled(bool),
+    Config(BedrockThinkingConfigSettings),
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct BedrockThinkingConfigSettings {
+    pub adaptive: Option<bool>,
+    pub has_xhigh: Option<bool>,
+    pub budget_tokens: Option<u64>,
 }
 
 #[with_fallible_options]
@@ -408,6 +425,26 @@ pub struct OpenAiCompatibleSettingsContent {
     pub api_url: String,
     pub available_models: Vec<OpenAiCompatibleAvailableModel>,
     pub custom_headers: Option<HashMap<String, String>>,
+    pub input_token_count: Option<OpenAiCompatibleInputTokenCountSettings>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct OpenAiCompatibleInputTokenCountSettings {
+    pub protocol: OpenAiCompatibleInputTokenCountProtocol,
+    pub api_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiCompatibleInputTokenCountProtocol {
+    Vllm,
+}
+
+impl MergeFrom for OpenAiCompatibleInputTokenCountProtocol {
+    fn merge_from(&mut self, other: &Self) {
+        *self = other.clone();
+    }
 }
 
 #[with_fallible_options]
