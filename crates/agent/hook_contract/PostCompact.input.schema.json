@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/PostCompact.input.schema.json",
+  "title": "PostCompact input",
+  "description": "Fires when the compaction summary has been received, BEFORE Zed stores it (differs from Claude Code, where it fires after).",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "trigger",
+    "compact_summary"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "PostCompact"
+    },
+    "trigger": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:3329).",
+      "enum": [
+        "manual",
+        "auto"
+      ]
+    },
+    "compact_summary": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:3329). Summary text, trimmed as Zed will store it."
+    }
+  },
+  "unevaluatedProperties": false
+}

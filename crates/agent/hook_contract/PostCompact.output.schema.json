@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/PostCompact.output.schema.json",
+  "title": "PostCompact output",
+  "description": "No Claude Code decision control. Zed extension: append a passage to the stored summary. Top level open for Claude Code compatibility (same reason as hookSpecificOutput): unknown fields are ignored.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-output.schema.json"
+    }
+  ],
+  "required": [],
+  "properties": {
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "Event-specific output. Open for Claude Code compatibility: Claude Code adds fields here across versions, and a script shared with Claude Code must not be rejected by Zed for a field Zed does not know. Unknown fields are ignored.",
+      "additionalProperties": true,
+      "required": [
+        "hookEventName"
+      ],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1064). Must be this event name; in Zed a mismatch is a hook failure.",
+          "const": "PostCompact"
+        },
+        "zed": {
+          "type": "object",
+          "description": "Zed extension. Passage appended to the summary.",
+          "additionalProperties": false,
+          "required": [
+            "append_to_summary"
+          ],
+          "properties": {
+            "append_to_summary": {
+              "type": "string",
+              "description": "Text appended at the end of the stored summary; it becomes part of the conversation.",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

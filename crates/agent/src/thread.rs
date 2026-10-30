@@ -3438,6 +3438,7 @@ impl Thread {
         let result: Result<ControlFlow<()>> = async {
             let provider =
                 cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
+            let manual = matches!(insertion, CompactionInsertion::Manual { .. });
             let stream = futures::select_biased! {
                 _ = cancellation_rx.changed().fuse() => {
                     if *cancellation_rx.borrow() {
@@ -3446,7 +3447,7 @@ impl Thread {
                     }
                     return Ok(ControlFlow::Continue(()));
                 }
-                result = crate::hooks::stream_completion(&provider, &model, request, this, None, cx).fuse() => result,
+                result = crate::hooks::stream_compaction_completion(&provider, &model, request, this, manual, cx).fuse() => result,
             };
             let mut stream = stream?;
 

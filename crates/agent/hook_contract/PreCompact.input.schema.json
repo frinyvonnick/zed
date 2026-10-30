@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/PreCompact.input.schema.json",
+  "title": "PreCompact input",
+  "description": "Fires before the compaction summary request is sent (provider wrapper, request recognised by its summary instruction).",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "trigger",
+    "custom_instructions"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "PreCompact"
+    },
+    "trigger": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:3303). Manual or automatic compaction.",
+      "enum": [
+        "manual",
+        "auto"
+      ]
+    },
+    "custom_instructions": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:3303). Always null in Zed 0.1 (no user text is attached to a manual compaction)."
+    }
+  },
+  "unevaluatedProperties": false
+}

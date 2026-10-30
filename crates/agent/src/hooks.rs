@@ -61,6 +61,8 @@ pub struct AgentHooks {
     pub post_tool_use: Vec<HookMatcherGroup>,
     pub before_model: Vec<HookMatcherGroup>,
     pub after_model: Vec<HookMatcherGroup>,
+    pub pre_compact: Vec<HookMatcherGroup>,
+    pub post_compact: Vec<HookMatcherGroup>,
 }
 
 impl Global for AgentHooks {}
@@ -84,6 +86,8 @@ impl AgentHooks {
             post_tool_use: matcher_groups_from_settings(&hooks["PostToolUse"], data_root),
             before_model: matcher_groups_from_settings(&hooks["BeforeModel"], data_root),
             after_model: matcher_groups_from_settings(&hooks["AfterModel"], data_root),
+            pre_compact: matcher_groups_from_settings(&hooks["PreCompact"], data_root),
+            post_compact: matcher_groups_from_settings(&hooks["PostCompact"], data_root),
         })
     }
 }
@@ -181,7 +185,14 @@ fn check_hook_settings(hooks: &serde_json::Value) -> Result<()> {
 }
 
 /// The events this version of Zed runs hooks for.
-const SUPPORTED_EVENTS: [&str; 4] = ["PreToolUse", "PostToolUse", "BeforeModel", "AfterModel"];
+const SUPPORTED_EVENTS: [&str; 6] = [
+    "PreToolUse",
+    "PostToolUse",
+    "BeforeModel",
+    "AfterModel",
+    "PreCompact",
+    "PostCompact",
+];
 
 fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
     anyhow::ensure!(
@@ -958,7 +969,7 @@ pub(crate) async fn stream_completion(
     cancellation: Option<watch::Receiver<bool>>,
     cx: &AsyncApp,
 ) -> Result<LanguageModelCompletionStream, LanguageModelCompletionError> {
-    match cx.update(|cx| ModelHooks::for_request(thread, &request, cx)) {
+    match cx.update(|cx| ModelHooks::for_request(thread, &request, None, cx)) {
         Some(hooks) => {
             hooks
                 .stream_completion(provider, model, request, cancellation, cx)
@@ -968,27 +979,86 @@ pub(crate) async fn stream_completion(
     }
 }
 
+/// Streams the compaction summary like [`stream_completion`], and also runs
+/// the `PreCompact` hooks, whose instructions extend the summary request, and
+/// the `PostCompact` hooks, whose passages end the summary Zed keeps.
+pub(crate) async fn stream_compaction_completion(
+    provider: &Arc<dyn LanguageModelProvider>,
+    model: &LanguageModel,
+    request: LanguageModelRequest,
+    thread: &WeakEntity<Thread>,
+    manual: bool,
+    cx: &AsyncApp,
+) -> Result<LanguageModelCompletionStream, LanguageModelCompletionError> {
+    let trigger = if manual {
+        CompactionTrigger::Manual
+    } else {
+        CompactionTrigger::Auto
+    };
+    match cx.update(|cx| ModelHooks::for_request(thread, &request, Some(trigger), cx)) {
+        Some(hooks) => {
+            hooks
+                .stream_completion(provider, model, request, None, cx)
+                .await
+        }
+        None => provider.stream_completion(model, request, cx).await,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CompactionTrigger {
+    Manual,
+    Auto,
+}
+
+impl CompactionTrigger {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 /// The hooks that run around one model request.
 struct ModelHooks {
     context: HookContext,
     before_model: Vec<Arc<dyn HookHandler>>,
     after_model: Vec<Arc<dyn HookHandler>>,
+    /// Set for the compaction summary request only.
+    compaction_trigger: Option<CompactionTrigger>,
+    pre_compact: Vec<Arc<dyn HookHandler>>,
+    post_compact: Vec<Arc<dyn HookHandler>>,
 }
 
 impl ModelHooks {
     fn for_request(
         thread: &WeakEntity<Thread>,
         request: &LanguageModelRequest,
+        compaction_trigger: Option<CompactionTrigger>,
         cx: &mut App,
     ) -> Option<Self> {
         let intent = intent_name(request.intent).unwrap_or_default();
-        let (before_model, after_model) = with_configured_hooks(cx, |hooks| {
-            (
-                matching_hooks(&hooks.before_model, intent),
-                matching_hooks(&hooks.after_model, intent),
-            )
-        })?;
-        if before_model.is_empty() && after_model.is_empty() {
+        let compaction_trigger = compaction_trigger.filter(|_| is_compaction_request(request));
+        let (before_model, after_model, pre_compact, post_compact) =
+            with_configured_hooks(cx, |hooks| {
+                let compaction_hooks = |groups: &[HookMatcherGroup]| {
+                    compaction_trigger
+                        .map(|trigger| matching_hooks(groups, trigger.name()))
+                        .unwrap_or_default()
+                };
+                (
+                    matching_hooks(&hooks.before_model, intent),
+                    matching_hooks(&hooks.after_model, intent),
+                    compaction_hooks(&hooks.pre_compact),
+                    compaction_hooks(&hooks.post_compact),
+                )
+            })?;
+        if before_model.is_empty()
+            && after_model.is_empty()
+            && pre_compact.is_empty()
+            && post_compact.is_empty()
+        {
             return None;
         }
         let thread = thread.upgrade()?;
@@ -1000,6 +1070,9 @@ impl ModelHooks {
             context,
             before_model,
             after_model,
+            compaction_trigger,
+            pre_compact,
+            post_compact,
         })
     }
 
@@ -1011,6 +1084,11 @@ impl ModelHooks {
         cancellation: Option<watch::Receiver<bool>>,
         cx: &AsyncApp,
     ) -> Result<LanguageModelCompletionStream, LanguageModelCompletionError> {
+        if let Some(trigger) = self.compaction_trigger
+            && !self.pre_compact.is_empty()
+        {
+            self.run_pre_compact(trigger, &mut request, cx).await;
+        }
         let request_fields = json!({
             "request_id": Uuid::new_v4().to_string(),
             "intent": intent_name(request.intent),
@@ -1038,7 +1116,18 @@ impl ModelHooks {
         }
 
         let started_at = Instant::now();
-        let stream = provider.stream_completion(model, request, cx).await?;
+        let mut stream = provider.stream_completion(model, request, cx).await?;
+        if let Some(trigger) = self.compaction_trigger
+            && !self.post_compact.is_empty()
+        {
+            stream = append_post_compact(
+                stream,
+                self.post_compact.clone(),
+                self.context.clone(),
+                trigger,
+                cx,
+            );
+        }
         if self.after_model.is_empty() {
             return Ok(stream);
         }
@@ -1055,6 +1144,56 @@ impl ModelHooks {
         })
         .detach();
         Ok(observe_response_end(stream, end_tx))
+    }
+
+    /// Runs the `PreCompact` hooks in declaration order and appends their
+    /// instructions to the summary instruction. They never prevent the
+    /// compaction.
+    async fn run_pre_compact(
+        &self,
+        trigger: CompactionTrigger,
+        request: &mut LanguageModelRequest,
+        cx: &AsyncApp,
+    ) {
+        let mut instructions = Vec::new();
+        for hook in &self.pre_compact {
+            let input = self.context.input(
+                "PreCompact",
+                json!({ "trigger": trigger.name(), "custom_instructions": null }),
+            );
+            let output = match cx.update(|cx| hook.call(input, cx)).await {
+                Ok(output) => output,
+                Err(error) => {
+                    log::warn!("PreCompact hook failed, continuing: {error:#}");
+                    continue;
+                }
+            };
+            if let Err(error) = check_event_name("PreCompact", &output) {
+                log::warn!("PreCompact hook output ignored: {error:#}");
+                continue;
+            }
+            if output.get("decision").is_some_and(|value| !value.is_null()) {
+                log::warn!(
+                    "a PreCompact hook cannot prevent the compaction; its refusal is ignored \
+                     (reason: {})",
+                    output["reason"].as_str().unwrap_or("none given")
+                );
+            }
+            log_unsupported_output_fields(&output, &UNSUPPORTED_COMPACTION_FIELDS);
+            warn_on_unknown_zed_fields("PreCompact", &output, "additional_instructions");
+            match hook_text(&output, "/hookSpecificOutput/zed/additional_instructions") {
+                Ok(text) => instructions.extend(text.map(str::to_string)),
+                Err(error) => log::warn!("PreCompact hook output ignored: {error:#}"),
+            }
+        }
+        if !instructions.is_empty()
+            && let Some(instruction) = request.messages.last_mut()
+        {
+            instruction.content.push(MessageContent::Text(format!(
+                "\n\n{}",
+                instructions.join("\n\n")
+            )));
+        }
     }
 
     /// Runs the `BeforeModel` hooks in declaration order and inserts their
@@ -1250,6 +1389,167 @@ impl ModelHooks {
             }
         }
     }
+}
+
+/// A text field of a hook output, trimmed. A field that is present must be
+/// a non-empty text.
+fn hook_text<'a>(output: &'a serde_json::Value, pointer: &str) -> Result<Option<&'a str>> {
+    match output.pointer(pointer) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let text = value
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .with_context(|| format!("`{pointer}` must be a non-empty text"))?;
+            Ok(Some(text))
+        }
+    }
+}
+
+/// Warns about a `zed` object that does not carry the event's one field: a
+/// misspelt name would otherwise be ignored silently.
+fn warn_on_unknown_zed_fields(event: &str, output: &serde_json::Value, field: &str) {
+    let Some(zed) = output
+        .pointer("/hookSpecificOutput/zed")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    let unknown = zed
+        .keys()
+        .filter(|key| key.as_str() != field)
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() || !zed.contains_key(field) {
+        log::warn!(
+            "{event} hook output: the `zed` object should hold `{field}`; ignored fields: {unknown:?}"
+        );
+    }
+}
+
+/// Output fields of the compaction events this version of Zed does not apply.
+const UNSUPPORTED_COMPACTION_FIELDS: [&str; 3] = ["/continue", "/systemMessage", "/stopReason"];
+
+/// Streams the compaction summary unchanged, then runs the `PostCompact`
+/// hooks with it and streams their passages as its end, so that they become
+/// part of the summary Zed keeps. An empty summary gets no passage: Zed still
+/// refuses it.
+fn append_post_compact(
+    stream: LanguageModelCompletionStream,
+    hooks: Vec<Arc<dyn HookHandler>>,
+    context: HookContext,
+    trigger: CompactionTrigger,
+    cx: &AsyncApp,
+) -> LanguageModelCompletionStream {
+    let (summary_tx, summary_rx) = oneshot::channel::<String>();
+    let (mut passage_tx, passage_rx) = oneshot::channel::<String>();
+    cx.spawn(async move |cx| {
+        let Ok(summary) = summary_rx.await else {
+            return;
+        };
+        // Stop the hooks when the compaction is abandoned.
+        let passage = {
+            let run = run_post_compact(&hooks, &context, trigger, summary, cx);
+            let abandoned = passage_tx.cancellation();
+            futures::pin_mut!(run, abandoned);
+            match futures::future::select(run, abandoned).await {
+                futures::future::Either::Left((passage, _)) => passage,
+                futures::future::Either::Right(_) => return,
+            }
+        };
+        if let Some(passage) = passage {
+            passage_tx.send(passage).ok();
+        }
+    })
+    .detach();
+
+    struct State {
+        stream: LanguageModelCompletionStream,
+        summary: String,
+        summary_tx: Option<oneshot::Sender<String>>,
+        passage_rx: Option<oneshot::Receiver<String>>,
+    }
+    let state = State {
+        // Some provider streams panic when polled after their end.
+        stream: stream.fuse().boxed(),
+        summary: String::new(),
+        summary_tx: Some(summary_tx),
+        passage_rx: Some(passage_rx),
+    };
+    futures::stream::unfold(state, |mut state| async move {
+        if let Some(event) = state.stream.next().await {
+            match &event {
+                Ok(LanguageModelCompletionEvent::Text(text)) => state.summary.push_str(text),
+                Err(_) => {
+                    state.summary_tx = None;
+                    state.passage_rx = None;
+                }
+                Ok(_) => {}
+            }
+            return Some((event, state));
+        }
+        let summary_tx = state.summary_tx.take()?;
+        let passage_rx = state.passage_rx.take()?;
+        let summary = state.summary.trim();
+        if summary.is_empty() {
+            return None;
+        }
+        summary_tx.send(summary.to_string()).ok()?;
+        let passage = passage_rx.await.ok()?;
+        Some((
+            Ok(LanguageModelCompletionEvent::Text(format!("\n\n{passage}"))),
+            state,
+        ))
+    })
+    .boxed()
+}
+
+/// Runs the `PostCompact` hooks in declaration order: each one gets the
+/// summary with the passages of the previous ones. Returns the passages.
+async fn run_post_compact(
+    hooks: &[Arc<dyn HookHandler>],
+    context: &HookContext,
+    trigger: CompactionTrigger,
+    mut summary: String,
+    cx: &AsyncApp,
+) -> Option<String> {
+    let mut passages = Vec::new();
+    for hook in hooks {
+        let input = context.input(
+            "PostCompact",
+            json!({ "trigger": trigger.name(), "compact_summary": summary }),
+        );
+        let output = match cx.update(|cx| hook.call(input, cx)).await {
+            Ok(output) => output,
+            Err(error) => {
+                log::warn!("PostCompact hook failed, continuing: {error:#}");
+                continue;
+            }
+        };
+        if let Err(error) = check_event_name("PostCompact", &output) {
+            log::warn!("PostCompact hook output ignored: {error:#}");
+            continue;
+        }
+        // A code 2 arrives as a refusal: Claude Code shows its stderr to the
+        // user only.
+        if output.get("decision").is_some_and(|value| !value.is_null()) {
+            log::warn!(
+                "a PostCompact hook has no decision to make; ignored (reason: {})",
+                output["reason"].as_str().unwrap_or("none given")
+            );
+        }
+        log_unsupported_output_fields(&output, &UNSUPPORTED_COMPACTION_FIELDS);
+        warn_on_unknown_zed_fields("PostCompact", &output, "append_to_summary");
+        match hook_text(&output, "/hookSpecificOutput/zed/append_to_summary") {
+            Ok(Some(passage)) => {
+                summary = format!("{summary}\n\n{passage}");
+                passages.push(passage.to_string());
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("PostCompact hook output ignored: {error:#}"),
+        }
+    }
+    (!passages.is_empty()).then(|| passages.join("\n\n"))
 }
 
 /// Resolves once `cancellation` is set; never without one.
@@ -2031,7 +2331,23 @@ pub(crate) mod tests {
         assert!(created);
     }
 
-    const CONTRACT_SCHEMAS: [(&str, &str); 12] = [
+    const CONTRACT_SCHEMAS: [(&str, &str); 16] = [
+        (
+            "PreCompact.input.schema.json",
+            include_str!("../hook_contract/PreCompact.input.schema.json"),
+        ),
+        (
+            "PreCompact.output.schema.json",
+            include_str!("../hook_contract/PreCompact.output.schema.json"),
+        ),
+        (
+            "PostCompact.input.schema.json",
+            include_str!("../hook_contract/PostCompact.input.schema.json"),
+        ),
+        (
+            "PostCompact.output.schema.json",
+            include_str!("../hook_contract/PostCompact.output.schema.json"),
+        ),
         (
             "BeforeModel.input.schema.json",
             include_str!("../hook_contract/BeforeModel.input.schema.json"),
@@ -3075,5 +3391,86 @@ pub(crate) mod tests {
             after_tools[after_tools.len() - 2..],
             sent["apres_resultats_outil"].as_array().unwrap()[..]
         );
+    }
+
+    #[test]
+    fn test_compaction_hooks_are_read_and_match_their_trigger() {
+        let check = json!({ "type": "command", "command": "check" });
+        let hooks = AgentHooks::from_settings(
+            &json!({
+                "PreCompact": [{ "matcher": "manual", "hooks": [check.clone()] }],
+                "PostCompact": [{ "hooks": [check] }],
+            }),
+            Path::new("/data/hooks"),
+        )
+        .unwrap();
+
+        assert_eq!(matching_hooks(&hooks.pre_compact, "manual").len(), 1);
+        assert_eq!(matching_hooks(&hooks.pre_compact, "auto").len(), 0);
+        assert_eq!(matching_hooks(&hooks.post_compact, "auto").len(), 1);
+    }
+
+    /// A provider stream that panics when polled again after its end, as
+    /// Ollama's does.
+    struct PanicsAfterEnd {
+        events: std::collections::VecDeque<
+            Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
+        >,
+        ended: bool,
+    }
+
+    impl futures::Stream for PanicsAfterEnd {
+        type Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            assert!(!self.ended, "the provider stream was polled after its end");
+            let next = self.events.pop_front();
+            self.ended = next.is_none();
+            std::task::Poll::Ready(next)
+        }
+    }
+
+    #[gpui::test]
+    async fn test_post_compact_never_polls_the_summary_after_its_end(cx: &mut TestAppContext) {
+        let (post, _) = fake_hook(Ok(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostCompact",
+                "zed": { "append_to_summary": "Plan." },
+            }
+        })));
+        let summary = PanicsAfterEnd {
+            events: vec![Ok(LanguageModelCompletionEvent::Text("summary".into()))].into(),
+            ended: false,
+        }
+        .boxed();
+        let context = HookContext {
+            session_id: "session-1".into(),
+            cwd: "/project".into(),
+            thread_id: "session-1".into(),
+            parent_thread_id: None,
+            depth: 0,
+        };
+
+        let stream = append_post_compact(
+            summary,
+            vec![post],
+            context,
+            CompactionTrigger::Auto,
+            &cx.to_async(),
+        );
+        let texts = stream
+            .filter_map(|event| async move {
+                match event {
+                    Ok(LanguageModelCompletionEvent::Text(text)) => Some(text),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(texts, ["summary", "\n\nPlan."]);
     }
 }

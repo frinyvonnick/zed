@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/PreCompact.output.schema.json",
+  "title": "PreCompact output",
+  "description": "Enriches the compaction; never prevents it. `decision: \"block\"` and exit code 2 are accepted for compatibility, logged and ignored. Top level open for Claude Code compatibility (same reason as hookSpecificOutput): unknown fields are ignored.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-output.schema.json"
+    }
+  ],
+  "required": [],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:3295). Only value: \"block\". Accepted, ignored in Zed (a hook never prevents compaction).",
+      "enum": [
+        "block"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:3295). Logged by Zed."
+    },
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "Event-specific output. Open for Claude Code compatibility: Claude Code adds fields here across versions, and a script shared with Claude Code must not be rejected by Zed for a field Zed does not know. Unknown fields are ignored.",
+      "additionalProperties": true,
+      "required": [
+        "hookEventName"
+      ],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1064). Must be this event name; in Zed a mismatch is a hook failure.",
+          "const": "PreCompact"
+        },
+        "zed": {
+          "type": "object",
+          "description": "Zed extension. Instructions appended to the summary request.",
+          "additionalProperties": false,
+          "required": [
+            "additional_instructions"
+          ],
+          "properties": {
+            "additional_instructions": {
+              "type": "string",
+              "description": "Text appended to the compaction instruction (for example: keep the plan path, the current skill, open questions).",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

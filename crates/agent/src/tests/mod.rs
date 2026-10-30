@@ -1971,6 +1971,411 @@ async fn test_before_model_reminders_cap_is_exact(cx: &mut TestAppContext) {
     );
 }
 
+fn compaction_hooks(
+    pre_compact: Vec<Arc<dyn crate::hooks::HookHandler>>,
+    post_compact: Vec<Arc<dyn crate::hooks::HookHandler>>,
+) -> crate::hooks::AgentHooks {
+    crate::hooks::AgentHooks {
+        pre_compact: hook_groups(pre_compact.into_iter().map(|hook| (None, hook)).collect()),
+        post_compact: hook_groups(post_compact.into_iter().map(|hook| (None, hook)).collect()),
+        ..Default::default()
+    }
+}
+
+fn pre_compact_output(instructions: &str) -> serde_json::Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreCompact",
+            "zed": { "additional_instructions": instructions },
+        }
+    })
+}
+
+fn post_compact_output(passage: &str) -> serde_json::Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostCompact",
+            "zed": { "append_to_summary": passage },
+        }
+    })
+}
+
+/// Sends a turn that ends in a tool call reporting a full context window, so
+/// that the next request is an automatic compaction.
+fn start_automatic_compaction(
+    thread: &Entity<Thread>,
+    fake: &FakeLanguageModelProvider,
+    model: &LanguageModel,
+    cx: &mut TestAppContext,
+) {
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_event(
+        model,
+        LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+            input_tokens: 950_000,
+            ..TokenUsage::default()
+        }),
+    );
+    send_echo_tool_use(fake, model);
+    cx.run_until_parked();
+}
+
+fn request_contains(request: &LanguageModelRequest, text: &str) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|message| message.string_contents().contains(text))
+}
+
+#[gpui::test]
+async fn test_pre_and_post_compact_shape_an_automatic_compaction(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (pre, pre_calls) = recording_hook(pre_compact_output("Keep the plan path."));
+    let (post, post_calls) = recording_hook(post_compact_output("Plan: docs/plan.md."));
+    cx.update(|cx| cx.set_global(compaction_hooks(vec![pre], vec![post])));
+    start_automatic_compaction(&thread, &fake, &model, cx);
+
+    let compaction_request = fake.pending_completions().pop().unwrap();
+    assert_eq!(
+        compaction_request.intent,
+        Some(CompletionIntent::ThreadContextSummarization)
+    );
+    let instruction = compaction_request.messages.last().unwrap();
+    assert!(
+        instruction
+            .content
+            .iter()
+            .any(|part| matches!(part, MessageContent::Text(text) if text == COMPACTION_PROMPT))
+    );
+    assert!(
+        instruction
+            .string_contents()
+            .contains("Keep the plan path.")
+    );
+    {
+        let pre_calls = pre_calls.lock().unwrap();
+        assert_eq!(pre_calls.len(), 1);
+        assert_eq!(pre_calls[0]["trigger"], "auto");
+        assert_eq!(pre_calls[0]["custom_instructions"], serde_json::Value::Null);
+        crate::hooks::tests::assert_matches_contract("PreCompact.input.schema.json", &pre_calls[0]);
+    }
+
+    fake.send_last_text(&model, "summary");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let next_request = fake.pending_completions().pop().unwrap();
+    assert!(
+        request_contains(&next_request, "summary\n\nPlan: docs/plan.md."),
+        "{next_request:#?}"
+    );
+    let post_calls = post_calls.lock().unwrap();
+    assert_eq!(post_calls.len(), 1);
+    assert_eq!(post_calls[0]["trigger"], "auto");
+    assert_eq!(post_calls[0]["compact_summary"], "summary");
+    crate::hooks::tests::assert_matches_contract("PostCompact.input.schema.json", &post_calls[0]);
+}
+
+#[gpui::test]
+async fn test_pre_compact_refusal_never_prevents_compaction(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let mut refusal = pre_compact_output("Keep the open questions.");
+    refusal["decision"] = json!("block");
+    refusal["reason"] = json!("Not now.");
+    let (refusing, _) = recording_hook(refusal);
+    cx.update(|cx| cx.set_global(compaction_hooks(vec![refusing], Vec::new())));
+    start_automatic_compaction(&thread, &fake, &model, cx);
+
+    let compaction_request = fake.pending_completions().pop().unwrap();
+    assert_eq!(
+        compaction_request.intent,
+        Some(CompletionIntent::ThreadContextSummarization)
+    );
+    assert!(request_contains(&compaction_request, COMPACTION_PROMPT));
+    assert!(request_contains(
+        &compaction_request,
+        "Keep the open questions."
+    ));
+}
+
+#[gpui::test]
+async fn test_post_compact_extends_a_manual_compaction(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (pre, pre_calls) = recording_hook(json!({}));
+    let (post, post_calls) = recording_hook(post_compact_output("Skill: tdd."));
+    cx.update(|cx| cx.set_global(compaction_hooks(vec![pre], vec![post])));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hi.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let _compact = thread
+        .update(cx, |thread, cx| {
+            thread.compact(ClientUserMessageId::new(), cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "manual summary");
+    fake.end_last(&model);
+    cx.run_until_parked();
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Next"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let next_request = fake.pending_completions().pop().unwrap();
+    assert!(
+        request_contains(&next_request, "manual summary\n\nSkill: tdd."),
+        "{next_request:#?}"
+    );
+    assert_eq!(pre_calls.lock().unwrap()[0]["trigger"], "manual");
+    assert_eq!(post_calls.lock().unwrap()[0]["trigger"], "manual");
+}
+
+#[gpui::test]
+async fn test_post_compact_leaves_the_panel_summary_unchanged(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (pre, pre_calls) = recording_hook(pre_compact_output("Never for summaries."));
+    let (post, post_calls) = recording_hook(post_compact_output("Never for summaries."));
+    cx.update(|cx| cx.set_global(compaction_hooks(vec![pre], vec![post])));
+    let summarizer = fake.model("summarizer");
+    thread.update(cx, |thread, cx| {
+        thread.set_summarization_model(Some(summarizer.clone()), cx)
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hi.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let summary = thread.update(cx, |thread, cx| thread.summary(cx));
+    cx.run_until_parked();
+    let summary_request = fake.pending_completions().pop().unwrap();
+    assert!(!request_contains(&summary_request, "Never for summaries."));
+    fake.send_last_text(&summarizer, "Summary.");
+    fake.end_last(&summarizer);
+    cx.run_until_parked();
+
+    assert_eq!(summary.await.as_deref(), Some("Summary."));
+    assert!(pre_calls.lock().unwrap().is_empty());
+    assert!(post_calls.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+async fn test_post_compact_is_skipped_for_an_empty_summary(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (post, post_calls) = recording_hook(post_compact_output("Would hide an empty summary."));
+    cx.update(|cx| cx.set_global(compaction_hooks(Vec::new(), vec![post])));
+    start_automatic_compaction(&thread, &fake, &model, cx);
+
+    fake.send_last_text(&model, "   ");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert!(post_calls.lock().unwrap().is_empty());
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    assert!(!markdown.contains("Would hide"), "{markdown}");
+}
+
+#[gpui::test]
+async fn test_failing_or_refusing_pre_compact_hooks_keep_the_summary(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    // A refusal, a code 2 (the same output) and a hook that fails.
+    let mut refusal = pre_compact_output("Keep the open questions.");
+    refusal["decision"] = json!("block");
+    refusal["reason"] = json!("Not now.");
+    let (refusing, _) = recording_hook(refusal);
+    let (code_two, _) = recording_hook(json!({ "decision": "block", "reason": "stderr text" }));
+    let failing_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failing: Arc<dyn crate::hooks::HookHandler> = Arc::new(FailingOnceHook {
+        calls: failing_calls.clone(),
+    });
+    cx.update(|cx| {
+        cx.set_global(compaction_hooks(
+            vec![refusing, code_two, failing],
+            Vec::new(),
+        ))
+    });
+    start_automatic_compaction(&thread, &fake, &model, cx);
+
+    let compaction_request = fake.pending_completions().pop().unwrap();
+    assert!(request_contains(&compaction_request, COMPACTION_PROMPT));
+    assert!(request_contains(
+        &compaction_request,
+        "Keep the open questions."
+    ));
+    assert_eq!(failing_calls.lock().unwrap().len(), 1);
+    fake.send_last_text(&model, "kept summary");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let next_request = fake.pending_completions().pop().unwrap();
+    assert!(
+        request_contains(&next_request, "kept summary"),
+        "{next_request:#?}"
+    );
+}
+
+#[gpui::test]
+async fn test_failing_or_refusing_post_compact_hooks_keep_the_summary(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    // A code 2 arrives as a refusal with the hook's stderr.
+    let (code_two, code_two_calls) =
+        recording_hook(json!({ "decision": "block", "reason": "stderr text" }));
+    let failing_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failing: Arc<dyn crate::hooks::HookHandler> = Arc::new(FailingOnceHook {
+        calls: failing_calls.clone(),
+    });
+    cx.update(|cx| cx.set_global(compaction_hooks(Vec::new(), vec![code_two, failing])));
+    start_automatic_compaction(&thread, &fake, &model, cx);
+    fake.send_last_text(&model, "kept summary");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert_eq!(code_two_calls.lock().unwrap().len(), 1);
+    assert_eq!(failing_calls.lock().unwrap().len(), 1);
+    let next_request = fake.pending_completions().pop().unwrap();
+    assert!(
+        request_contains(&next_request, "kept summary"),
+        "{next_request:#?}"
+    );
+    assert!(!request_contains(&next_request, "kept summary\n\n"));
+    assert!(!request_contains(&next_request, "stderr text"));
+}
+
+#[gpui::test]
+async fn test_post_compact_hooks_chain_their_passages(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (first, _) = recording_hook(post_compact_output("One."));
+    let (second, second_calls) = recording_hook(post_compact_output("Two."));
+    cx.update(|cx| cx.set_global(compaction_hooks(Vec::new(), vec![first, second])));
+    start_automatic_compaction(&thread, &fake, &model, cx);
+    fake.send_last_text(&model, "summary");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert_eq!(
+        second_calls.lock().unwrap()[0]["compact_summary"],
+        "summary\n\nOne."
+    );
+    let next_request = fake.pending_completions().pop().unwrap();
+    assert!(
+        request_contains(&next_request, "summary\n\nOne.\n\nTwo."),
+        "{next_request:#?}"
+    );
+}
+
+#[gpui::test]
+async fn test_retried_compaction_appends_the_passage_once(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (post, post_calls) = recording_hook(post_compact_output("Plan: docs/plan.md."));
+    cx.update(|cx| cx.set_global(compaction_hooks(Vec::new(), vec![post])));
+    start_automatic_compaction(&thread, &fake, &model, cx);
+
+    // The first attempt fails after a partial summary, and is retried.
+    fake.send_last_text(&model, "partial");
+    let retry_after = Duration::from_secs(3);
+    fake.send_last_error(
+        &model,
+        LanguageModelCompletionError::from_http_status(
+            LanguageModelProviderName::new("test"),
+            http_client::StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded".to_string(),
+            Some(retry_after),
+        ),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::maximum_retry_delay_with_jitter(retry_after));
+    cx.run_until_parked();
+
+    let retry = fake.pending_completions().pop().unwrap();
+    assert_eq!(
+        retry.intent,
+        Some(CompletionIntent::ThreadContextSummarization)
+    );
+    fake.send_last_text(&model, "summary");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert_eq!(post_calls.lock().unwrap().len(), 1);
+    let next_request = fake.pending_completions().pop().unwrap();
+    let passages = next_request
+        .messages
+        .iter()
+        .map(|message| {
+            message
+                .string_contents()
+                .matches("Plan: docs/plan.md.")
+                .count()
+        })
+        .sum::<usize>();
+    assert_eq!(passages, 1, "{next_request:#?}");
+}
+
 #[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_basic_tool_calls(cx: &mut TestAppContext) {
