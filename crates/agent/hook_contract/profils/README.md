@@ -32,7 +32,7 @@ Il faut node 24 ou plus (TypeScript lancé sans compilation), sans aucune dépen
 | `PreToolUse` | refuse un outil hors profil, une skill non permise (outil `skill`, ou `read_file` du `SKILL.md` d'une racine de skills), `create_thread` pour tout sous-agent ; sur `spawn_agent`, refuse un libellé sans profil permis, sinon marque le libellé `[profil#xxxx]` et pose le modèle du profil |
 | `SubagentStart` | note le profil du sous-agent dans le dossier de données |
 
-La conversation racine prend le profil `pilote`. Un profil illisible ou ambigu restreint plus, jamais
+La conversation racine prend le profil `pilote`, ou celui que nomme `--root-profile <nom>`. Un profil illisible ou ambigu restreint plus, jamais
 moins ; dans le doute, il est rejeté :
 
 - l'en-tête est rejeté pour une ligne que le lecteur ne sait pas placer, une table écrite `{...}`,

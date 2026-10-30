@@ -25,10 +25,11 @@ function run(
   input: object,
   data: string,
   agentDirs: string[] = [agents],
+  extraArgs: string[] = [],
 ): { output: any; stderr: string } {
   const result = spawnSync(
     process.execPath,
-    [script, ...agentDirs.flatMap((dir) => ['--agents', dir])],
+    [script, ...agentDirs.flatMap((dir) => ['--agents', dir]), ...extraArgs],
     { input: JSON.stringify(input), env: { ...process.env, ZED_HOOK_DATA_DIR: data }, encoding: 'utf8' },
   );
   assert.equal(result.status, 0, result.stderr);
@@ -422,6 +423,31 @@ test('without a pilote, the root agent keeps reading only and is told which file
     'pilote.md': testAgent('pilote').replace(/^description:.*\r?\n/m, ''),
   });
   assert.match(assertReadOnlyRoot(noDescription), /description/);
+});
+
+test('--root-profile gives the root conversation another profile', () => {
+  const data = dataDir();
+  const rootProfile = ['--root-profile', 'explorateur'];
+  const request = run(beforeModel('root-1', false), data, [agents], rootProfile).output.hookSpecificOutput;
+  assert.ok(request.system_prompt_insert.includes('Tu es un explorateur en lecture seule.'));
+  assert.ok(!request.system_prompt_insert.includes('Tu es le pilote.'));
+  assert.deepEqual(request.remove_tools, [
+    'diagnostics', 'edit_file', 'fetch', 'spawn_agent', 'terminal', 'write_file',
+  ]);
+  const rootWrite = { ...toolCall('root-1', 'write_file', { path: 'a.md', content: 'x' }) } as any;
+  rootWrite.zed = { ...rootWrite.zed, is_subagent: false, parent_thread_id: null, depth: 0 };
+  assert.equal(
+    run(rootWrite, data, [agents], rootProfile).output.hookSpecificOutput.permissionDecisionReason,
+    'The write_file tool is not allowed for the explorateur profile.',
+  );
+});
+
+test('an unknown --root-profile leaves the root agent with reading only, naming its file', () => {
+  const { output, stderr } = run(beforeModel('root-1', false), dataDir(), [agents], ['--root-profile', 'absent']);
+  const specific = output.hookSpecificOutput;
+  assert.deepEqual(specific.remove_tools, NOT_READ, JSON.stringify(output));
+  assert.match(specific.ephemeral_messages[0], /`absent` agent profile.*absent\.md/);
+  assert.match(stderr, /absent\.md/);
 });
 
 test('a blank session_id is a new launch, checked like any other', () => {

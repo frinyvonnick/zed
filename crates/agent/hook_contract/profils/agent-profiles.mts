@@ -4,17 +4,19 @@
 // generic hook events. Zed knows nothing of profiles.
 //
 // Declare it as a command hook on BeforeModel, PreToolUse and SubagentStart:
-//   node agent-profiles.mts --agents <dir> [--agents <dir>]
+//   node agent-profiles.mts --agents <dir> [--agents <dir>] [--root-profile <name>]
 //
 // - Personal profiles come from the `--agents` directories; project profiles
 //   from `<cwd>/.zed/agents`, which may not declare hooks.
-// - The root conversation runs the `pilote` profile. Its `zed.tools` entry
-//   `spawn_agent(a, b)` lists the profiles it may launch, named at the start
-//   of the spawn_agent label: `[explorateur] where is the token read?`.
+// - The root conversation runs the `pilote` profile, or the one --root-profile
+//   names. Its `zed.tools` entry `spawn_agent(a, b)` lists the profiles it may
+//   launch, named at the start of the spawn_agent label:
+//   `[explorateur] where is the token read?`.
 // - The profile each subagent runs is kept in ZED_HOOK_DATA_DIR, one file per
 //   subagent thread, so that it survives a restart of Zed.
-// - A profile that cannot be read restricts more, never less: without
-//   `pilote`, spawning is refused; a subagent of unknown profile gets no tool.
+// - A profile that cannot be read restricts more, never less: without the root
+//   profile, the root agent keeps reading only; a subagent of unknown profile
+//   gets no tool.
 import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -51,8 +53,8 @@ const READ_TOOLS = ['find_path', 'grep', 'list_directory', 'read_file'];
 const PROFILE_UNKNOWN =
   "This subagent's profile is unknown (renamed or removed), so its tools are refused.";
 
-function piloteMissing(fix: string): string {
-  return `No readable \`pilote\` agent profile (fix ${fix}), so this agent keeps its reading tools only.`;
+function rootProfileMissing(name: string, fix: string): string {
+  return `No readable \`${name}\` agent profile (fix ${fix}), so this agent keeps its reading tools only.`;
 }
 
 function hookFailed(error: unknown): string {
@@ -505,17 +507,17 @@ function tokenFile(token: string): string {
   return path.join(dataDir, 'tokens', token);
 }
 
-function agentOf(input: any, profiles: Map<string, Profile>, agentDirs: string[]): Agent {
+function agentOf(input: any, profiles: Map<string, Profile>, agentDirs: string[], rootName: string): Agent {
   if (!input.zed?.is_subagent) {
-    const pilote = profiles.get(ROOT_PROFILE);
-    if (!pilote) {
-      const rejected = rejectedFiles.find((file) => path.basename(file) === `${ROOT_PROFILE}.md`);
-      const fix = rejected ?? agentDirs.map((dir) => path.join(dir, `${ROOT_PROFILE}.md`)).join(' or ');
-      const message = piloteMissing(fix || `${ROOT_PROFILE}.md`);
+    const root = profiles.get(rootName);
+    if (!root) {
+      const rejected = rejectedFiles.find((file) => path.basename(file) === `${rootName}.md`);
+      const fix = rejected ?? agentDirs.map((dir) => path.join(dir, `${rootName}.md`)).join(' or ');
+      const message = rootProfileMissing(rootName, fix || `${rootName}.md`);
       warnOnce(message);
       return { kind: 'no-pilote', message };
     }
-    return { kind: 'profile', profile: pilote, isSubagent: false };
+    return { kind: 'profile', profile: root, isSubagent: false };
   }
   try {
     const name = JSON.parse(fs.readFileSync(recordFile(input.zed.thread_id), 'utf8')).profile;
@@ -680,7 +682,8 @@ try {
   if (input.hook_event_name === 'SubagentStart') {
     output = subagentStart(input, profiles);
   } else if (input.hook_event_name === 'BeforeModel' || input.hook_event_name === 'PreToolUse') {
-    const agent = agentOf(input, profiles, agentDirs);
+    const rootName = optionValues(args, '--root-profile').at(-1) ?? ROOT_PROFILE;
+    const agent = agentOf(input, profiles, agentDirs, rootName);
     if (agent.kind === 'profile') warnUnapplied(agent.profile);
     output = input.hook_event_name === 'BeforeModel'
       ? beforeModel(input, agent, profiles)
