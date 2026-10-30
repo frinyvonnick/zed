@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/PreToolUse.output.schema.json",
+  "title": "PreToolUse output",
+  "description": "Allows, denies, asks, or corrects the tool call. Exit code 2 = deny. Top level open for Claude Code compatibility (same reason as hookSpecificOutput): unknown fields are ignored.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-output.schema.json"
+    }
+  ],
+  "required": [],
+  "properties": {
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "Event-specific output. Open for Claude Code compatibility: Claude Code adds fields here across versions, and a script shared with Claude Code must not be rejected by Zed for a field Zed does not know. Unknown fields are ignored.",
+      "additionalProperties": true,
+      "required": [
+        "hookEventName"
+      ],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1064). Must be this event name.",
+          "const": "PreToolUse"
+        },
+        "permissionDecision": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1965). \"defer\" is accepted and treated as no decision (Claude Code supports it only in -p mode).",
+          "enum": [
+            "allow",
+            "deny",
+            "ask",
+            "defer"
+          ]
+        },
+        "permissionDecisionReason": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1966). For deny: sent to the model as the tool result. For allow/ask: shown to the user."
+        },
+        "updatedInput": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1967). Replaces the whole input. Open here because its shape depends on the tool; Zed validates it against tool-inputs.schema.json before running the tool and treats a mismatch as a hook failure."
+        },
+        "additionalContext": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1305). Text added to the model context."
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

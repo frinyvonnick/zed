@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/common-input.schema.json",
+  "title": "Common hook input",
+  "description": "Fields sent to every hook. The Claude Code fields keep their Claude Code names and meaning; every Zed-only field lives under the `zed` object so that it can never collide with a future Claude Code field.",
+  "$comment": "Fragment: closed by the including event schema through unevaluatedProperties: false.",
+  "type": "object",
+  "required": [
+    "session_id",
+    "transcript_path",
+    "cwd",
+    "hook_event_name",
+    "zed"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:736). Identifier of the root agent conversation. Inside a subagent it stays the identifier of the root conversation, as in Claude Code; the current conversation is `zed.thread_id`.",
+      "minLength": 1
+    },
+    "transcript_path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:738). Always null in Zed: Zed keeps conversations in its database and writes no transcript file. Sent so that Claude Code scripts reading it get a defined value."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:739). Absolute path of the first worktree root of the project.",
+      "minLength": 1
+    },
+    "hook_event_name": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:743). Name of the event that fired.",
+      "enum": [
+        "SessionStart",
+        "SessionEnd",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "PreCompact",
+        "PostCompact",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+        "BeforeModel",
+        "AfterModel",
+        "ZedModelError",
+        "ZedCountTokens"
+      ]
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:749). Present only when the hook fires inside a subagent: identifier of that subagent (its Zed thread id).",
+      "minLength": 1
+    },
+    "agent_type": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:750). Present only inside a subagent. Zed has no agent types: the value is the `label` the parent gave to `spawn_agent`.",
+      "minLength": 1
+    },
+    "zed": {
+      "type": "object",
+      "$ref": "#/$defs/ZedContext",
+      "description": "Zed extension. Contract version and thread position."
+    }
+  },
+  "$defs": {
+    "ZedContext": {
+      "type": "object",
+      "description": "Zed extension block, present in every input.",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "thread_id",
+        "parent_thread_id",
+        "is_subagent",
+        "depth",
+        "timestamp"
+      ],
+      "properties": {
+        "contract_version": {
+          "type": "string",
+          "description": "Version of this contract (semantic versioning). Scripts compare the major number.",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "thread_id": {
+          "type": "string",
+          "description": "Identifier of the conversation (thread) the event belongs to. Stable across Zed restarts; a hook uses it to file its own state under ZED_HOOK_DATA_DIR (Zed keeps no hook state).",
+          "minLength": 1
+        },
+        "parent_thread_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Identifier of the parent conversation for a subagent, null for a root conversation."
+        },
+        "is_subagent": {
+          "type": "boolean",
+          "description": "True when the conversation is a subagent."
+        },
+        "depth": {
+          "type": "integer",
+          "description": "0 for a root conversation, 1 for its subagents, 2 for theirs, and so on.",
+          "minimum": 0
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Moment the event fired, RFC 3339.",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

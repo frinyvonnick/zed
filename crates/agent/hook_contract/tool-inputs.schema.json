@@ -1,0 +1,506 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/tool-inputs.schema.json",
+  "title": "Zed tool inputs",
+  "description": "Input of the Zed agent tools a hook most often inspects, read from crates/agent/src/tools/*.rs at zed-industries/zed@422b53c. `ToolInput` picks the schema from `tool_name` (if/then) rather than a oneOf on the input alone: an unknown tool (MCP, other built-ins) needs an open fallback, and an open fallback would also match every known input, which breaks oneOf exclusivity.",
+  "type": "object",
+  "required": [
+    "tool_name",
+    "tool_input"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "tool_name": {
+      "type": "string",
+      "description": "Zed tool name (not the Claude Code name: `terminal`, not `Bash`).",
+      "minLength": 1
+    },
+    "tool_input": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Arguments of the call, typed by the if/then below for known tools."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "terminal"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "#/$defs/TerminalInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "sandboxed_terminal"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "#/$defs/SandboxedTerminalInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "read_file"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "#/$defs/ReadFileInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "edit_file"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "#/$defs/EditFileInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "write_file"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "#/$defs/WriteFileInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "grep"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "#/$defs/GrepInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "spawn_agent"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "#/$defs/SpawnAgentInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "skill"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "#/$defs/SkillInput"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "TerminalInput": {
+      "type": "object",
+      "description": "Input of `terminal` (TerminalToolInput).",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "cd"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "Shell one-liner to run."
+        },
+        "cd": {
+          "type": "string",
+          "description": "Working directory: a project root or a subdirectory, by name or absolute path."
+        },
+        "timeout_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum runtime in milliseconds.",
+          "minimum": 0
+        },
+        "head_lines": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Return only the first N lines of output.",
+          "minimum": 0
+        },
+        "tail_lines": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Return only the last N lines of output.",
+          "minimum": 0
+        }
+      }
+    },
+    "SandboxedTerminalInput": {
+      "type": "object",
+      "description": "Input of `sandboxed_terminal` (SandboxedTerminalToolInput).",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "cd"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "Shell one-liner to run."
+        },
+        "cd": {
+          "type": "string",
+          "description": "Working directory: a project root or a subdirectory, by name or absolute path."
+        },
+        "timeout_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum runtime in milliseconds.",
+          "minimum": 0
+        },
+        "head_lines": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Return only the first N lines of output.",
+          "minimum": 0
+        },
+        "tail_lines": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Return only the last N lines of output.",
+          "minimum": 0
+        },
+        "allow_hosts": {
+          "type": "array",
+          "description": "Hosts the command needs outbound network access to.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_all_hosts": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Allow every host."
+        },
+        "fs_write_paths": {
+          "type": "array",
+          "description": "Paths the command may write outside the default area.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_fs_write_all": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Allow writing anywhere."
+        },
+        "unsandboxed": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Ask to run outside the sandbox."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why the extra access is needed."
+        }
+      }
+    },
+    "ReadFileInput": {
+      "type": "object",
+      "description": "Input of `read_file` (ReadFileToolInput).",
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Project-relative path, first component = a project root."
+        },
+        "start_line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "First line, 1-based.",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Last line, 1-based, inclusive.",
+          "minimum": 1
+        }
+      }
+    },
+    "EditFileInput": {
+      "type": "object",
+      "description": "Input of `edit_file` (EditFileToolInput).",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "edits"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Project-relative path of the file to edit."
+        },
+        "edits": {
+          "type": "array",
+          "description": "Edits applied in order.",
+          "items": {
+            "type": "object",
+            "description": "One replacement (edit_session.rs `Edit`).",
+            "additionalProperties": false,
+            "required": [
+              "old_text",
+              "new_text"
+            ],
+            "properties": {
+              "old_text": {
+                "type": "string",
+                "description": "Text to find (fuzzy match on whitespace)."
+              },
+              "new_text": {
+                "type": "string",
+                "description": "Replacement text."
+              }
+            }
+          }
+        }
+      }
+    },
+    "WriteFileInput": {
+      "type": "object",
+      "description": "Input of `write_file` (WriteFileToolInput).",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "content"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Project-relative path of the file to create or overwrite."
+        },
+        "content": {
+          "type": "string",
+          "description": "Full new content."
+        }
+      }
+    },
+    "GrepInput": {
+      "type": "object",
+      "description": "Input of `grep` (GrepToolInput).",
+      "additionalProperties": false,
+      "required": [
+        "regex"
+      ],
+      "properties": {
+        "regex": {
+          "type": "string",
+          "description": "Regular expression to search for."
+        },
+        "include_pattern": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Glob restricting the searched files."
+        },
+        "offset": {
+          "type": "integer",
+          "description": "Result offset for paging (default 0).",
+          "minimum": 0
+        },
+        "case_sensitive": {
+          "type": "boolean",
+          "description": "Case-sensitive search (default false)."
+        },
+        "max_ancestor_lines": {
+          "type": "integer",
+          "description": "Maximum ancestor lines shown per match.",
+          "minimum": 0
+        },
+        "context_lines": {
+          "type": "integer",
+          "description": "Context lines around each match.",
+          "minimum": 0
+        }
+      }
+    },
+    "SpawnAgentInput": {
+      "type": "object",
+      "description": "Input of `spawn_agent` (SpawnAgentToolInput).",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "message"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "description": "Short label of the subagent."
+        },
+        "message": {
+          "type": "string",
+          "description": "Brief sent to the subagent."
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Existing subagent session to resume."
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Model requested for the subagent."
+        }
+      }
+    },
+    "SkillInput": {
+      "type": "object",
+      "description": "Input of `skill` (SkillToolInput).",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name of the skill to load."
+        }
+      }
+    }
+  }
+}

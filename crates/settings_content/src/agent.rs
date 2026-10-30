@@ -410,6 +410,11 @@ pub struct AgentSettingsContent {
     /// These are populated when choosing "Allow always" from a sandbox
     /// escalation prompt.
     pub sandbox_permissions: Option<SandboxPermissionsContent>,
+
+    /// Programs run on agent events, in the Claude Code hooks format: event
+    /// name, then matcher groups, then handlers. Only `PreToolUse` and
+    /// `PostToolUse` command handlers run for now.
+    pub hooks: Option<serde_json::Value>,
 }
 
 impl AgentSettingsContent {

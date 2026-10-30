@@ -250,6 +250,7 @@ pub struct AgentSettings {
     pub show_merge_conflict_indicator: bool,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
+    pub hooks: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -846,6 +847,7 @@ impl Settings for AgentSettings {
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
+            hooks: agent.hooks,
         }
     }
 }

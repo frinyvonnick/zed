@@ -4536,6 +4536,7 @@ impl Thread {
             }
         }
 
+        crate::hooks::wrap_tools(self, &mut tools, cx);
         tools
     }
 

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/PostToolUse.output.schema.json",
+  "title": "PostToolUse output",
+  "description": "Adds a note next to the result or replaces what the model sees. The tool has already run. Top level open for Claude Code compatibility (same reason as hookSpecificOutput): unknown fields are ignored.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-output.schema.json"
+    }
+  ],
+  "required": [],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2230). Only value: \"block\". Adds `reason` next to the result; the model still sees the original output.",
+      "enum": [
+        "block"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2231). Note added next to the result."
+    },
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "Event-specific output. Open for Claude Code compatibility: Claude Code adds fields here across versions, and a script shared with Claude Code must not be rejected by Zed for a field Zed does not know. Unknown fields are ignored.",
+      "additionalProperties": true,
+      "required": [
+        "hookEventName"
+      ],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1064). Must be this event name.",
+          "const": "PostToolUse"
+        },
+        "additionalContext": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1305). Text added to the model context."
+        },
+        "updatedToolOutput": {
+          "type": "object",
+          "$ref": "model-message.schema.json#/$defs/ToolResponse",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:2234) name. Replaces what the model sees; must follow the Zed ToolResponse shape."
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

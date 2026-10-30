@@ -845,6 +845,188 @@ async fn test_prompt_caching(cx: &mut TestAppContext) {
     );
 }
 
+struct DenyHook(&'static str);
+
+impl crate::hooks::HookHandler for DenyHook {
+    fn call(&self, _input: serde_json::Value, _cx: &mut App) -> Task<Result<serde_json::Value>> {
+        Task::ready(Ok(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": self.0,
+            }
+        })))
+    }
+}
+
+/// The echo tool, counting its runs, to prove that a denied call never runs.
+struct CountingEchoTool(Arc<AtomicUsize>);
+
+impl AgentTool for CountingEchoTool {
+    type Input = EchoToolInput;
+    type Output = String;
+
+    const NAME: &'static str = EchoTool::NAME;
+
+    fn kind() -> acp_v2::ToolKind {
+        acp_v2::ToolKind::Other
+    }
+
+    fn initial_title(
+        &self,
+        _input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        "Echo".into()
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        _event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        cx.spawn(async move |_cx| Ok(input.recv().await.map_err(|e| e.to_string())?.text))
+    }
+}
+
+fn send_echo_tool_use(fake: &FakeLanguageModelProvider, model: &LanguageModel) {
+    fake.send_last_event(
+        model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "tool_1".into(),
+            name: EchoTool::NAME.into(),
+            raw_input: json!({"text": "test"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"text": "test"})),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(model);
+}
+
+fn last_tool_result(fake: &FakeLanguageModelProvider) -> LanguageModelToolResult {
+    let completion = fake.pending_completions().pop().unwrap();
+    let Some(MessageContent::ToolResult(tool_result)) = completion
+        .messages
+        .last()
+        .and_then(|message| message.content.first())
+    else {
+        panic!("expected a tool result in the last request message");
+    };
+    tool_result.clone()
+}
+
+#[gpui::test]
+async fn test_pre_tool_use_hook_denies_tool_call(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            pre_tool_use: vec![crate::hooks::HookMatcherGroup {
+                matcher: Some(EchoTool::NAME.into()),
+                hooks: vec![Arc::new(DenyHook("Echo is not allowed here."))],
+            }],
+            post_tool_use: Vec::new(),
+        });
+    });
+    let runs = Arc::new(AtomicUsize::new(0));
+    thread.update(cx, |thread, _| {
+        thread.add_tool(CountingEchoTool(runs.clone()))
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+
+    let tool_result = last_tool_result(&fake);
+    assert!(tool_result.is_error);
+    assert_eq!(
+        tool_result.content,
+        vec!["Echo is not allowed here.".into()]
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+}
+
+#[gpui::test]
+async fn test_command_hook_from_settings_denies_tool_call(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let data_root =
+        std::env::temp_dir().join(format!("zed-agent-hook-settings-{}", std::process::id()));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::HookDataRoot(data_root.clone()));
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.agent.get_or_insert_default().hooks = Some(json!({
+                    "PreToolUse": [{
+                        "matcher": "echo",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "bash",
+                            "args": ["-c", "echo 'Echo is off.' >&2; exit 2"],
+                        }],
+                    }],
+                }));
+            });
+        });
+    });
+    let runs = Arc::new(AtomicUsize::new(0));
+    thread.update(cx, |thread, _| {
+        thread.add_tool(CountingEchoTool(runs.clone()))
+    });
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    send_echo_tool_use(&fake, &model);
+    // The hook runs in a real process: wait until the thread reports the
+    // end of the tool call.
+    loop {
+        let event = events
+            .next()
+            .await
+            .expect("the thread should report the tool call")
+            .unwrap();
+        if let ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(update)) = event
+            && matches!(
+                update.status,
+                MaybeUndefined::Value(
+                    acp_v2::ToolCallStatus::Failed | acp_v2::ToolCallStatus::Completed
+                )
+            )
+        {
+            break;
+        }
+    }
+    cx.run_until_parked();
+    let hook_dirs = std::fs::read_dir(&data_root).map_or(0, |dirs| dirs.count());
+    std::fs::remove_dir_all(&data_root).ok();
+
+    let tool_result = last_tool_result(&fake);
+    assert!(tool_result.is_error);
+    assert_eq!(tool_result.content, vec!["Echo is off.".into()]);
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(hook_dirs, 1);
+}
+
 #[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_basic_tool_calls(cx: &mut TestAppContext) {

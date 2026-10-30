@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/PreToolUse.input.schema.json",
+  "title": "PreToolUse input",
+  "description": "Fires after the complete tool input is known and before the tool runs (tool wrapper). Covers subagents.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "terminal"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "tool-inputs.schema.json#/$defs/TerminalInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "sandboxed_terminal"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "tool-inputs.schema.json#/$defs/SandboxedTerminalInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "read_file"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "tool-inputs.schema.json#/$defs/ReadFileInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "edit_file"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "tool-inputs.schema.json#/$defs/EditFileInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "write_file"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "tool-inputs.schema.json#/$defs/WriteFileInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "grep"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "tool-inputs.schema.json#/$defs/GrepInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "spawn_agent"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "tool-inputs.schema.json#/$defs/SpawnAgentInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "const": "skill"
+          }
+        },
+        "required": [
+          "tool_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tool_input": {
+            "type": "object",
+            "$ref": "tool-inputs.schema.json#/$defs/SkillInput"
+          }
+        }
+      }
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "tool_name",
+    "tool_input",
+    "tool_use_id"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "PreToolUse"
+    },
+    "tool_name": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1758), with the Zed tool name.",
+      "minLength": 1
+    },
+    "tool_input": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1758). Arguments of the call; typed per tool by tool-inputs.schema.json, open for unknown tools (MCP, other built-ins)."
+    },
+    "tool_use_id": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1758). Id of the tool call.",
+      "minLength": 1
+    }
+  },
+  "unevaluatedProperties": false
+}
