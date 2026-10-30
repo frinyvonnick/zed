@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/UserPromptSubmit.input.schema.json",
+  "title": "UserPromptSubmit input",
+  "description": "Fires when the user sends a message to the agent, before the first model request of the turn.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "prompt"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "UserPromptSubmit"
+    },
+    "prompt": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1498). Text the user submitted."
+    }
+  },
+  "unevaluatedProperties": false
+}

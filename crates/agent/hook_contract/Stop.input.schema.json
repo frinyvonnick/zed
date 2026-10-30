@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/Stop.input.schema.json",
+  "title": "Stop input",
+  "description": "Fires when a turn of a root conversation ends normally (event stream observer). Not on stop button, not on error.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "stop_hook_active",
+    "last_assistant_message"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "Stop"
+    },
+    "stop_hook_active": {
+      "type": "boolean",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2748). True when this turn was continued by a Stop hook."
+    },
+    "last_assistant_message": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2748). Text of the final assistant message."
+    }
+  },
+  "unevaluatedProperties": false
+}

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/SessionStart.input.schema.json",
+  "title": "SessionStart input",
+  "description": "Fires when Zed creates an agent conversation object (gpui observe_new). Notification only in Zed.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "source"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "SessionStart"
+    },
+    "source": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1266). Zed sends \"startup\" for a new conversation and \"resume\" for a reopened one; the other Claude Code values are never sent.",
+      "enum": [
+        "startup",
+        "resume",
+        "clear",
+        "compact",
+        "fork"
+      ]
+    },
+    "model": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1267) (optional there too). Id of the model of the conversation.",
+      "minLength": 1
+    }
+  },
+  "unevaluatedProperties": false
+}

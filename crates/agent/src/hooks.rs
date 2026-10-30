@@ -1,7 +1,9 @@
 use crate::{
-    AgentModelId, AgentToolOutput, AnyAgentTool, SubagentHandle, TerminalHandle, Thread,
-    ThreadEnvironment, ToolCallEventStream, ToolInput, ToolInputPayload, ToolInputSender,
+    AgentMessageContent, AgentModelId, AgentToolOutput, AnyAgentTool, Message, SubagentHandle,
+    TerminalHandle, Thread, ThreadEnvironment, ThreadEventStream, ToolCallEventStream, ToolInput,
+    ToolInputPayload, ToolInputSender, UserMessage, UserMessageContent,
 };
+use acp_thread::ClientUserMessageId;
 use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::{AgentSettings, COMPACTION_PROMPT};
 use anyhow::{Context as _, Result, anyhow};
@@ -71,6 +73,10 @@ pub struct AgentHooks {
     pub zed_model_error: Vec<HookMatcherGroup>,
     pub subagent_start: Vec<HookMatcherGroup>,
     pub subagent_stop: Vec<HookMatcherGroup>,
+    pub stop: Vec<HookMatcherGroup>,
+    pub user_prompt_submit: Vec<HookMatcherGroup>,
+    pub session_start: Vec<HookMatcherGroup>,
+    pub session_end: Vec<HookMatcherGroup>,
 }
 
 impl Global for AgentHooks {}
@@ -99,6 +105,10 @@ impl AgentHooks {
             zed_model_error: matcher_groups_from_settings(&hooks["ZedModelError"], data_root),
             subagent_start: matcher_groups_from_settings(&hooks["SubagentStart"], data_root),
             subagent_stop: matcher_groups_from_settings(&hooks["SubagentStop"], data_root),
+            stop: matcher_groups_from_settings(&hooks["Stop"], data_root),
+            user_prompt_submit: matcher_groups_from_settings(&hooks["UserPromptSubmit"], data_root),
+            session_start: matcher_groups_from_settings(&hooks["SessionStart"], data_root),
+            session_end: matcher_groups_from_settings(&hooks["SessionEnd"], data_root),
         })
     }
 }
@@ -196,7 +206,7 @@ fn check_hook_settings(hooks: &serde_json::Value) -> Result<()> {
 }
 
 /// The events this version of Zed runs hooks for.
-const SUPPORTED_EVENTS: [&str; 9] = [
+const SUPPORTED_EVENTS: [&str; 13] = [
     "PreToolUse",
     "PostToolUse",
     "BeforeModel",
@@ -206,6 +216,10 @@ const SUPPORTED_EVENTS: [&str; 9] = [
     "ZedModelError",
     "SubagentStart",
     "SubagentStop",
+    "Stop",
+    "UserPromptSubmit",
+    "SessionStart",
+    "SessionEnd",
 ];
 
 fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
@@ -371,7 +385,10 @@ impl HookHandler for CommandHook {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let timeout = Duration::from_secs(self.timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
+        let timeout = self
+            .timeout
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| default_hook_timeout(&hook_event_name));
         let timer = cx.background_executor().timer(timeout);
         let data_dir = self.data_dir.clone();
         cx.background_executor().spawn(async move {
@@ -424,6 +441,15 @@ const HOOK_DATA_DIR_VAR: &str = "ZED_HOOK_DATA_DIR";
 /// Seconds before a hook is cancelled, as in Claude Code.
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 600;
 
+/// The timeout of a hook without one: as in Claude Code, shorter for
+/// `UserPromptSubmit`, which holds the user's message.
+fn default_hook_timeout(hook_event_name: &str) -> Duration {
+    Duration::from_secs(match hook_event_name {
+        "UserPromptSubmit" => 30,
+        _ => DEFAULT_HOOK_TIMEOUT_SECS,
+    })
+}
+
 /// Turns what a command hook printed into the hook output. Exit code 0 reads
 /// stdout as JSON, exit code 2 denies (or blocks) with stderr as the reason,
 /// and any other exit code is a hook failure.
@@ -441,6 +467,14 @@ fn parse_command_output(
     match exit_code {
         Some(0) => match object {
             Some(object) => object.context("hook printed invalid JSON"),
+            // As in Claude Code, plain text from `UserPromptSubmit` is context
+            // for the model.
+            None if hook_event_name == "UserPromptSubmit" && !stdout.is_empty() => Ok(json!({
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event_name,
+                    "additionalContext": stdout,
+                }
+            })),
             None => {
                 if !stdout.is_empty() {
                     log::info!("agent hook printed plain text, ignored: {stdout}");
@@ -507,10 +541,24 @@ fn is_name_matcher(matcher: &str) -> bool {
 /// The hooks whose matcher selects `value`, in declaration order. A handler
 /// declared in several matching groups runs once, as in Claude Code.
 fn matching_hooks(groups: &[HookMatcherGroup], value: &str) -> Vec<Arc<dyn HookHandler>> {
+    distinct_hooks(
+        groups
+            .iter()
+            .filter(|group| matcher_matches(group.matcher.as_deref(), value)),
+    )
+}
+
+/// The hooks of an event that has no field to match, in declaration order:
+/// as in Claude Code, a matcher is ignored.
+fn all_hooks(groups: &[HookMatcherGroup]) -> Vec<Arc<dyn HookHandler>> {
+    distinct_hooks(groups.iter())
+}
+
+fn distinct_hooks<'a>(
+    groups: impl Iterator<Item = &'a HookMatcherGroup>,
+) -> Vec<Arc<dyn HookHandler>> {
     let mut seen = HashSet::default();
     groups
-        .iter()
-        .filter(|group| matcher_matches(group.matcher.as_deref(), value))
         .flat_map(|group| group.hooks.iter().cloned())
         .filter(|hook| hook.dedup_key().is_none_or(|key| seen.insert(key)))
         .collect()
@@ -665,7 +713,6 @@ fn pre_tool_use_decision(output: &serde_json::Value) -> Option<&str> {
 /// Logs the output fields this version of Zed reads but does not apply yet.
 fn log_unsupported_fields(output: &serde_json::Value) {
     for (field, value) in [
-        ("continue", &output["continue"]),
         ("suppressOutput", &output["suppressOutput"]),
         (
             "hookSpecificOutput.updatedToolOutput",
@@ -855,6 +902,13 @@ impl AnyAgentTool for HookedTool {
                     log_unsupported_fields(&output);
                     let specific = &output["hookSpecificOutput"];
                     let context = specific["additionalContext"].as_str();
+                    // A pause comes before any decision: it refuses the call
+                    // with its reason and stops the chain, like any refusal.
+                    if let Some(stop_reason) = requested_pause(&output) {
+                        cx.update(|cx| record_pause(&self.context.thread_id, stop_reason, cx));
+                        notes.extend(context.map(str::to_string));
+                        return Err(refused_output(stop_reason.to_string(), notes));
+                    }
                     // The decision comes first: a refusal stands whatever else
                     // the hook returned.
                     let reason = specific["permissionDecisionReason"]
@@ -919,6 +973,7 @@ impl AnyAgentTool for HookedTool {
                 Err(output) => (true, output),
             };
 
+            // A pause lets the chain run to its end.
             for hook in &self.post_tool_use {
                 let hook_input = self.context.input(
                     "PostToolUse",
@@ -941,6 +996,9 @@ impl AnyAgentTool for HookedTool {
                     continue;
                 }
                 log_unsupported_fields(&hook_output);
+                if let Some(stop_reason) = requested_pause(&hook_output) {
+                    cx.update(|cx| record_pause(&self.context.thread_id, stop_reason, cx));
+                }
                 if hook_output["decision"] == "block"
                     && let Some(reason) = hook_output["reason"]
                         .as_str()
@@ -1325,7 +1383,7 @@ impl ModelHooks {
                     .by_hook
                     .insert(sent_key, conversation_hashes.clone());
             });
-            log_unsupported_output_fields(&output, &["/systemMessage"]);
+            log_unsupported_output_fields(&output, &["/continue", "/systemMessage"]);
             replace_tool_results(request, replacements);
             if let Some(max_output_tokens) = max_output_tokens {
                 // Only lowers the reserve; a higher value is ignored.
@@ -1428,7 +1486,7 @@ impl ModelHooks {
                     continue;
                 }
             };
-            log_unsupported_output_fields(&output, &["/systemMessage"]);
+            log_unsupported_output_fields(&output, &["/continue", "/systemMessage"]);
             if let Some(usage) = usage {
                 if let Some(fields) = event_fields.as_object_mut() {
                     fields.insert("usage".into(), usage_to_contract(&usage));
@@ -1543,7 +1601,7 @@ impl ErrorHooks {
             }
             // Deviation from the 0.1 contract: `systemMessage` is not shown to
             // the user yet, only logged.
-            log_unsupported_output_fields(&output, &["/systemMessage"]);
+            log_unsupported_output_fields(&output, &["/continue", "/systemMessage"]);
             let name = match output.pointer("/hookSpecificOutput/category") {
                 None | Some(serde_json::Value::Null) => continue,
                 Some(name) => name.as_str().unwrap_or_default(),
@@ -2351,6 +2409,478 @@ fn log_unsupported_output_fields(output: &serde_json::Value, pointers: &[&str]) 
     }
 }
 
+/// Pauses asked with `continue: false`, by thread id, with their `stopReason`.
+#[derive(Default)]
+struct RequestedPauses(HashMap<String, String>);
+
+impl Global for RequestedPauses {}
+
+/// The `stopReason` of the pause a hook output asks for with
+/// `continue: false`. A pause is not a cut: it comes before the next request
+/// to the model.
+fn requested_pause(output: &serde_json::Value) -> Option<&str> {
+    match &output["continue"] {
+        serde_json::Value::Bool(false) => Some(
+            output["stopReason"]
+                .as_str()
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or("A hook paused the agent."),
+        ),
+        serde_json::Value::Null | serde_json::Value::Bool(true) => None,
+        value => {
+            log::warn!("agent hook `continue` must be a boolean, not {value}; ignored");
+            None
+        }
+    }
+}
+
+pub(crate) fn record_pause(thread_id: &str, stop_reason: &str, cx: &mut App) {
+    cx.default_global::<RequestedPauses>()
+        .0
+        .insert(thread_id.to_string(), stop_reason.to_string());
+}
+
+pub(crate) fn take_pause(thread_id: &str, cx: &mut App) -> Option<String> {
+    if !cx.has_global::<RequestedPauses>() {
+        return None;
+    }
+    cx.global_mut::<RequestedPauses>().0.remove(thread_id)
+}
+
+fn pause_pending(thread_id: &str, cx: &App) -> bool {
+    cx.try_global::<RequestedPauses>()
+        .is_some_and(|pauses| pauses.0.contains_key(thread_id))
+}
+
+/// Ends the turn when a hook asked for a pause since it began: Zed adds the
+/// pause to the conversation, and a subagent passes it on to its parent, so
+/// that the conversation waits for the user. Returns whether it paused.
+pub(crate) fn pause_turn(
+    thread: &WeakEntity<Thread>,
+    event_stream: &ThreadEventStream,
+    cx: &mut AsyncApp,
+) -> Result<bool> {
+    let pause = thread.update(cx, |thread, cx| {
+        let pause = take_pause(&thread.id().to_string(), cx)?;
+        if let Some(parent_thread_id) = thread.parent_thread_id() {
+            record_pause(&parent_thread_id.to_string(), &pause, cx);
+        }
+        Some(pause)
+    })?;
+    let Some(pause) = pause else {
+        return Ok(false);
+    };
+    add_hook_message(
+        thread,
+        event_stream,
+        None,
+        format!("Paused by a hook: {pause}"),
+        cx,
+    )?;
+    Ok(true)
+}
+
+/// Prefix of the ids of the messages hooks add to a conversation, so that
+/// they are told apart from the user's own messages, even once reopened.
+const HOOK_MESSAGE_ID_PREFIX: &str = "zed-hook-";
+
+pub(crate) fn is_hook_message(id: &ClientUserMessageId) -> bool {
+    serde_json::to_value(id)
+        .ok()
+        .and_then(|id| id.as_str().map(|id| id.starts_with(HOOK_MESSAGE_ID_PREFIX)))
+        .unwrap_or(false)
+}
+
+/// Adds a message from a hook to the conversation, as a user message shown
+/// the same way live and once the conversation is reopened. With `id`, it
+/// replaces that message.
+fn add_hook_message(
+    thread: &WeakEntity<Thread>,
+    event_stream: &ThreadEventStream,
+    id: Option<ClientUserMessageId>,
+    text: String,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let id = match id {
+        Some(id) => id,
+        None => {
+            serde_json::from_value(json!(format!("{HOOK_MESSAGE_ID_PREFIX}{}", Uuid::new_v4())))?
+        }
+    };
+    let message = UserMessage {
+        id,
+        content: [UserMessageContent::Text(text)].into(),
+    };
+    thread.update(cx, |thread, cx| {
+        thread.upsert_user_message(message.id.clone(), message.content.clone(), cx)
+    })?;
+    event_stream.send_user_message(&message);
+    Ok(())
+}
+
+/// The last message each root conversation submitted to `UserPromptSubmit`,
+/// with its text and the block it got, by thread id: a retry of the same
+/// message must not run the hooks again, or a counting guard would count it
+/// twice.
+#[derive(Default)]
+struct SubmittedPrompts(HashMap<String, (ClientUserMessageId, String, Option<String>)>);
+
+impl Global for SubmittedPrompts {}
+
+/// Runs a hook of a conversation event until it answers or the turn is
+/// cancelled; cancelling drops its task, which kills its process. A failure,
+/// or an output for another event, counts as no output.
+async fn call_conversation_hook(
+    hook: &Arc<dyn HookHandler>,
+    event: &str,
+    input: serde_json::Value,
+    cancellation: Option<watch::Receiver<bool>>,
+    cx: &AsyncApp,
+) -> Option<serde_json::Value> {
+    let task = cx.update(|cx| hook.call(input, cx));
+    let result = futures::select_biased! {
+        _ = wait_for_cancellation(cancellation).fuse() => return None,
+        result = task.fuse() => result,
+    };
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => {
+            log::warn!("{event} hook failed, continuing: {error:#}");
+            return None;
+        }
+    };
+    if let Err(error) = check_event_name(event, &output) {
+        log::warn!("{event} hook output ignored: {error:#}");
+        return None;
+    }
+    if !output["decision"].is_null() && output["decision"] != "block" {
+        log::warn!(
+            "{event} hook `decision` must be \"block\", not {}; ignored",
+            output["decision"]
+        );
+    }
+    Some(output)
+}
+
+/// Starts a turn: forgets a pause asked during an earlier turn, then runs the
+/// `UserPromptSubmit` hooks when the turn starts from a message the user
+/// sent in a root conversation. A block, or a pause, replaces the message
+/// with the reason and ends the turn; the hooks' context follows the message
+/// as a message of its own. Returns whether the turn goes on.
+pub(crate) async fn before_turn(
+    thread: &WeakEntity<Thread>,
+    event_stream: &ThreadEventStream,
+    user_message_id: Option<&ClientUserMessageId>,
+    mut cancellation: watch::Receiver<bool>,
+    cx: &mut AsyncApp,
+) -> Result<bool> {
+    let submit = thread.update(cx, |thread, cx| {
+        take_pause(&thread.id().to_string(), cx);
+        let Some(Message::User(message)) = thread.last_message() else {
+            return None;
+        };
+        // A retry starts from a message a hook added: the hooks already ran.
+        if thread.is_subagent()
+            || is_hook_message(&message.id)
+            || Some(&message.id) != user_message_id
+        {
+            return None;
+        }
+        let hooks = with_configured_hooks(cx, |hooks| all_hooks(&hooks.user_prompt_submit))?;
+        (!hooks.is_empty()).then(|| (hooks, HookContext::for_thread(thread, cx), message.clone()))
+    })?;
+    let Some((hooks, context, message)) = submit else {
+        return Ok(true);
+    };
+    let prompt = prompt_text(&message.content);
+    let submitted = cx.update(|cx| {
+        cx.try_global::<SubmittedPrompts>()
+            .and_then(|submitted| submitted.0.get(&context.thread_id).cloned())
+    });
+    let retried = match submitted {
+        Some((id, text, block)) if id == message.id && text == prompt => Some(block),
+        _ => None,
+    };
+    if let Some(block) = retried {
+        // A retry of the same message: its block holds, and its context is
+        // still in the conversation.
+        if let Some(reason) = block {
+            add_hook_message(
+                thread,
+                event_stream,
+                Some(message.id),
+                format!("Message blocked by a UserPromptSubmit hook: {reason}"),
+                cx,
+            )?;
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+    let input = context.input("UserPromptSubmit", json!({ "prompt": prompt }));
+    let mut notes = Vec::new();
+    let mut pause = None;
+    let mut block = None;
+    for hook in &hooks {
+        let output = call_conversation_hook(
+            hook,
+            "UserPromptSubmit",
+            input.clone(),
+            Some(cancellation.clone()),
+            cx,
+        )
+        .await;
+        // A cancelled turn leaves the conversation as it is.
+        if *cancellation.borrow() {
+            return Ok(false);
+        }
+        let Some(output) = output else {
+            continue;
+        };
+        log_unsupported_output_fields(&output, &["/systemMessage"]);
+        // A pause lets the chain run to its end; a block stops it.
+        if let Some(stop_reason) = requested_pause(&output) {
+            pause = Some(stop_reason.to_string());
+        }
+        if output["decision"] == "block" {
+            let reason = output["reason"]
+                .as_str()
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or("no reason given");
+            block = Some(reason.to_string());
+            break;
+        }
+        match hook_text(&output, "/hookSpecificOutput/additionalContext") {
+            Ok(note) => notes.extend(note.map(str::to_string)),
+            Err(error) => log::warn!("UserPromptSubmit hook context ignored: {error:#}"),
+        }
+    }
+    let block = block.or(pause);
+    cx.update(|cx| {
+        cx.default_global::<SubmittedPrompts>().0.insert(
+            context.thread_id.clone(),
+            (message.id.clone(), prompt, block.clone()),
+        )
+    });
+    if let Some(reason) = block {
+        // The message stays, replaced by the block, so that it shows the same
+        // live and once reopened; the model never sees its text.
+        add_hook_message(
+            thread,
+            event_stream,
+            Some(message.id),
+            format!("Message blocked by a UserPromptSubmit hook: {reason}"),
+            cx,
+        )?;
+        return Ok(false);
+    }
+    if !notes.is_empty() {
+        let text = notes
+            .iter()
+            .map(|note| {
+                format!(
+                    "<system-reminder>\nUserPromptSubmit hook additional context: {}\n</system-reminder>",
+                    escape_reminder_tags(note)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        add_hook_message(thread, event_stream, None, text, cx)?;
+    }
+    Ok(true)
+}
+
+/// The text the user typed, with mentions as links.
+fn prompt_text(content: &[UserMessageContent]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            UserMessageContent::Text(text) => Some(text.clone()),
+            UserMessageContent::Mention { uri, .. } => Some(uri.as_link().to_string()),
+            UserMessageContent::Image(_) => None,
+        })
+        .collect()
+}
+
+/// Runs the `Stop` hooks when a turn of a root conversation ends normally.
+/// Returns whether one continued the turn, with its reason as a message; a
+/// pause ends the turn with its own message instead.
+pub(crate) async fn continue_after_stop(
+    thread: &WeakEntity<Thread>,
+    event_stream: &ThreadEventStream,
+    stop_hook_active: &mut bool,
+    mut cancellation: watch::Receiver<bool>,
+    cx: &mut AsyncApp,
+) -> Result<bool> {
+    let stop = thread.update(cx, |thread, cx| {
+        if thread.is_subagent() {
+            return None;
+        }
+        let hooks = with_configured_hooks(cx, |hooks| all_hooks(&hooks.stop))?;
+        (!hooks.is_empty()).then(|| {
+            let last_message = match thread.last_message() {
+                Some(Message::Agent(message)) => message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        AgentMessageContent::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => String::new(),
+            };
+            (hooks, HookContext::for_thread(thread, cx), last_message)
+        })
+    })?;
+    let Some((hooks, context, last_assistant_message)) = stop else {
+        return Ok(false);
+    };
+    let mut pause = None;
+    let mut feedback = None;
+    for hook in &hooks {
+        let input = context.input(
+            "Stop",
+            json!({
+                "stop_hook_active": *stop_hook_active,
+                "last_assistant_message": last_assistant_message,
+            }),
+        );
+        let output =
+            call_conversation_hook(hook, "Stop", input, Some(cancellation.clone()), cx).await;
+        if *cancellation.borrow() {
+            return Ok(false);
+        }
+        let Some(output) = output else {
+            continue;
+        };
+        log_unsupported_output_fields(
+            &output,
+            &["/systemMessage", "/hookSpecificOutput/additionalContext"],
+        );
+        // The chain runs to its end, then the pause applies.
+        if let Some(stop_reason) = requested_pause(&output) {
+            pause = Some(stop_reason.to_string());
+            continue;
+        }
+        if output["decision"] != "block" {
+            continue;
+        }
+        match hook_text(&output, "/reason") {
+            Ok(Some(reason)) if !reason.trim().is_empty() => {
+                feedback = Some(reason.to_string());
+                break;
+            }
+            _ => log::warn!("a Stop hook continued the turn without a reason; ignored"),
+        }
+    }
+    if let Some(pause) = pause {
+        add_hook_message(
+            thread,
+            event_stream,
+            None,
+            format!("Paused by a hook: {pause}"),
+            cx,
+        )?;
+        return Ok(false);
+    }
+    let Some(feedback) = feedback else {
+        return Ok(false);
+    };
+    add_hook_message(
+        thread,
+        event_stream,
+        None,
+        format!("Stop hook feedback: {feedback}"),
+        cx,
+    )?;
+    *stop_hook_active = true;
+    Ok(true)
+}
+
+/// Runs the `SessionStart` hooks when Zed registers a root conversation: a
+/// new one (`startup`), or one with history (`resume`). A subagent's hooks
+/// would get its parent's `session_id`.
+pub(crate) fn session_start(thread: &Entity<Thread>, cx: &mut App) {
+    let thread = thread.read(cx);
+    if thread.is_subagent() {
+        return;
+    }
+    let source = if thread.last_message().is_none() {
+        "startup"
+    } else {
+        "resume"
+    };
+    let Some(hooks) =
+        with_configured_hooks(cx, |hooks| matching_hooks(&hooks.session_start, source))
+    else {
+        return;
+    };
+    let mut fields = json!({ "source": source });
+    if let Some(model) = thread.model() {
+        fields["model"] = json!(model.id().0.to_string());
+    }
+    let input = HookContext::for_thread(thread, cx).input("SessionStart", fields);
+    notify_hooks("SessionStart", hooks, input, cx);
+}
+
+/// Forgets a pause the conversation never reached and its last prompt, then
+/// runs the
+/// `SessionEnd` hooks when Zed releases a root conversation. gpui does not
+/// say why, so the reason is always `other`.
+pub(crate) fn session_end(thread: &Entity<Thread>, cx: &mut App) {
+    let (thread_id, is_subagent) = thread.read_with(cx, |thread, _| {
+        (thread.id().to_string(), thread.is_subagent())
+    });
+    take_pause(&thread_id, cx);
+    if cx.has_global::<SubmittedPrompts>() {
+        cx.global_mut::<SubmittedPrompts>().0.remove(&thread_id);
+    }
+    if is_subagent {
+        return;
+    }
+    let Some(hooks) =
+        with_configured_hooks(cx, |hooks| matching_hooks(&hooks.session_end, "other"))
+    else {
+        return;
+    };
+    let input = HookContext::for_thread(thread.read(cx), cx)
+        .input("SessionEnd", json!({ "reason": "other" }));
+    notify_hooks("SessionEnd", hooks, input, cx);
+}
+
+/// Runs the hooks of a notification event in the background, in declaration
+/// order. Their output decides nothing: a code 2 is logged, until Zed can
+/// show it to the user.
+fn notify_hooks(
+    event: &'static str,
+    hooks: Vec<Arc<dyn HookHandler>>,
+    input: serde_json::Value,
+    cx: &mut App,
+) {
+    if hooks.is_empty() {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        for hook in &hooks {
+            let Some(output) = call_conversation_hook(hook, event, input.clone(), None, cx).await
+            else {
+                continue;
+            };
+            if output["decision"] == "block" {
+                log::warn!("{event} hook: {}", output["reason"].as_str().unwrap_or(""));
+            }
+            log_unsupported_output_fields(
+                &output,
+                &[
+                    "/continue",
+                    "/systemMessage",
+                    "/hookSpecificOutput/additionalContext",
+                ],
+            );
+        }
+    })
+    .detach();
+}
+
 /// Wraps the environment of a thread so that the subagents it creates run
 /// the `SubagentStart` and `SubagentStop` hooks.
 pub(crate) fn wrap_environment(
@@ -2543,6 +3073,11 @@ impl SubagentHandle for HookedSubagent {
                     }
                 };
                 first_answer.get_or_insert_with(|| output.clone());
+                // A paused subagent passed its pause on: the parent waits for
+                // the user rather than continue it.
+                if cx.update(|cx| pause_pending(&context.thread_id, cx)) {
+                    return Ok(output);
+                }
                 let continuation = run_subagent_stop(
                     &stop,
                     &context,
@@ -3061,7 +3596,39 @@ pub(crate) mod tests {
         assert!(created);
     }
 
-    const CONTRACT_SCHEMAS: [(&str, &str); 22] = [
+    const CONTRACT_SCHEMAS: [(&str, &str); 30] = [
+        (
+            "Stop.input.schema.json",
+            include_str!("../hook_contract/Stop.input.schema.json"),
+        ),
+        (
+            "Stop.output.schema.json",
+            include_str!("../hook_contract/Stop.output.schema.json"),
+        ),
+        (
+            "UserPromptSubmit.input.schema.json",
+            include_str!("../hook_contract/UserPromptSubmit.input.schema.json"),
+        ),
+        (
+            "UserPromptSubmit.output.schema.json",
+            include_str!("../hook_contract/UserPromptSubmit.output.schema.json"),
+        ),
+        (
+            "SessionStart.input.schema.json",
+            include_str!("../hook_contract/SessionStart.input.schema.json"),
+        ),
+        (
+            "SessionStart.output.schema.json",
+            include_str!("../hook_contract/SessionStart.output.schema.json"),
+        ),
+        (
+            "SessionEnd.input.schema.json",
+            include_str!("../hook_contract/SessionEnd.input.schema.json"),
+        ),
+        (
+            "SessionEnd.output.schema.json",
+            include_str!("../hook_contract/SessionEnd.output.schema.json"),
+        ),
         (
             "SubagentStart.input.schema.json",
             include_str!("../hook_contract/SubagentStart.input.schema.json"),
@@ -3980,13 +4547,13 @@ pub(crate) mod tests {
         assert_eq!(matching_hooks(&hooks.after_model, "user_prompt").len(), 1);
 
         let error = AgentHooks::from_settings(
-            &json!({ "Stop": [{ "hooks": [check] }] }),
+            &json!({ "PermissionRequest": [{ "hooks": [check] }] }),
             Path::new("/data/hooks"),
         )
         .err()
         .expect("events Zed does not run yet must be refused")
         .to_string();
-        assert!(error.contains("Stop"), "{error}");
+        assert!(error.contains("PermissionRequest"), "{error}");
     }
 
     #[test]
@@ -5068,5 +5635,108 @@ pub(crate) mod tests {
 
         assert!(error.contains("model overloaded"), "{error}");
         assert!(error.contains("first answer"), "{error}");
+    }
+    #[test]
+    fn test_user_prompt_submit_plain_text_is_context() {
+        assert_eq!(
+            parse_command_output("UserPromptSubmit", Some(0), "Branch: feat/hooks\n", "").unwrap(),
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "Branch: feat/hooks",
+                }
+            })
+        );
+        // Other events still ignore plain text.
+        assert_eq!(
+            parse_command_output("SessionStart", Some(0), "hello", "").unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn test_user_prompt_submit_hooks_time_out_sooner() {
+        assert_eq!(
+            default_hook_timeout("UserPromptSubmit"),
+            Duration::from_secs(30)
+        );
+        assert_eq!(default_hook_timeout("Stop"), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_agent_hooks_from_settings_reads_conversation_events() {
+        let groups = json!([{ "hooks": [{ "type": "command", "command": "check" }] }]);
+        let hooks = AgentHooks::from_settings(
+            &json!({
+                "Stop": groups,
+                "UserPromptSubmit": groups,
+                "SessionStart": groups,
+                "SessionEnd": groups,
+            }),
+            Path::new("/data/hooks"),
+        )
+        .unwrap();
+
+        assert_eq!(hooks.stop.len(), 1);
+        assert_eq!(hooks.user_prompt_submit.len(), 1);
+        assert_eq!(hooks.session_start.len(), 1);
+        assert_eq!(hooks.session_end.len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_a_post_tool_use_pause_runs_the_whole_chain(cx: &mut TestAppContext) {
+        let (pause, _) = fake_hook(Ok(json!({ "continue": false, "stopReason": "Stop here." })));
+        let (later, later_calls) = fake_hook(Ok(json!({})));
+        let (tool, _) = hooked_echo(Vec::new(), vec![pause, later]);
+
+        let (is_error, texts) = run_echo(tool, "hello", cx).await;
+
+        assert!(!is_error);
+        assert_eq!(texts, vec!["hello".to_string()]);
+        assert_eq!(later_calls.borrow().len(), 1);
+        assert_eq!(
+            cx.update(|cx| take_pause("session-1", cx)).as_deref(),
+            Some("Stop here.")
+        );
+        assert_eq!(cx.update(|cx| take_pause("session-1", cx)), None);
+    }
+
+    #[gpui::test]
+    async fn test_a_pre_tool_use_pause_refuses_the_call_and_stops_the_chain(
+        cx: &mut TestAppContext,
+    ) {
+        let mut output = pre_tool_use(json!({ "updatedInput": { "text": "changed" } }));
+        output["continue"] = json!(false);
+        output["stopReason"] = json!("Out of scope.");
+        let (pause, _) = fake_hook(Ok(output));
+        let (later, later_calls) = fake_hook(Ok(json!({})));
+        let (tool, echo) = hooked_echo(vec![pause, later], Vec::new());
+
+        let (is_error, texts) = run_echo(tool, "hello", cx).await;
+
+        assert!(is_error);
+        assert_eq!(texts, vec!["Out of scope.".to_string()]);
+        assert_eq!(echo.runs.get(), 0);
+        assert!(later_calls.borrow().is_empty());
+        assert_eq!(
+            cx.update(|cx| take_pause("session-1", cx)).as_deref(),
+            Some("Out of scope.")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_paused_subagent_is_not_continued_by_subagent_stop(cx: &mut TestAppContext) {
+        let (block, block_calls) =
+            fake_hook(Ok(json!({ "decision": "block", "reason": "Again." })));
+        cx.update(|cx| cx.set_global(subagent_hooks(Vec::new(), vec![block])));
+        let (environment, messages) = hooked_environment(&["paused answer"]);
+        // The subagent's turn ended on a pause, passed on to its parent.
+        cx.update(|cx| record_pause("session-1", "Out of scope.", cx));
+
+        let output = spawn(&environment, "explorer", "Find the config", cx).await;
+
+        assert_eq!(output.unwrap(), "paused answer");
+        assert!(block_calls.borrow().is_empty());
+        assert_eq!(messages.borrow().len(), 1);
     }
 }

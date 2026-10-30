@@ -1015,6 +1015,7 @@ impl NativeAgent {
             }
         });
 
+        crate::hooks::session_start(&thread_handle, cx);
         self.sessions.insert(
             session_id,
             Session {
@@ -1952,6 +1953,7 @@ impl NativeAgent {
             .thread
             .update(cx, |thread, cx| thread.cancel(cx))
             .detach();
+        crate::hooks::session_end(&session.thread, cx);
         self.enqueue_save(session_id, draft_prompt, cx);
         let Some(session) = self.sessions.remove(session_id) else {
             return;
@@ -4040,24 +4042,29 @@ impl SubagentHandle for NativeSubagentHandle {
                         None => anyhow!("Native agent stopped with an error"),
                     }),
                     acp_v2::StopReason::EndTurn => thread.read_with(cx, |thread, _cx| {
-                        thread
-                            .last_message()
-                            .and_then(|message| {
-                                let content = message.as_agent_message()?
-                                    .content
-                                    .iter()
-                                    .filter_map(|content| match content {
-                                        AgentMessageContent::Text(text) => Some(text.as_str()),
-                                        _ => None,
-                                    })
-                                    .join("\n\n");
-                                if content.is_empty() {
-                                    None
-                                } else {
-                                    Some(content)
-                                }
-                            })
-                            .context("No response from subagent")
+                        // Messages hooks added at the end, such as a pause, follow the answer.
+                        let (message, hook_messages) = thread.split_trailing_hook_messages();
+                        let answer = message.and_then(|message| {
+                            Some(message.as_agent_message()?
+                                .content
+                                .iter()
+                                .filter_map(|content| match content {
+                                    AgentMessageContent::Text(text) => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .join("\n\n"))
+                        });
+                        let content = answer
+                            .into_iter()
+                            .chain(hook_messages.iter().map(|message| message.to_markdown().trim().to_string()))
+                            .filter(|content| !content.is_empty())
+                            .join("\n\n");
+                        if content.is_empty() {
+                            None
+                        } else {
+                            Some(content)
+                        }
+                        .context("No response from subagent")
                     }),
                     _ => Err(anyhow!("Native subagent returned an unsupported stop reason")),
                 },

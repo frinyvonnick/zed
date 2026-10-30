@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/SessionEnd.output.schema.json",
+  "title": "SessionEnd output",
+  "description": "No decision control, as in Claude Code. Output is ignored. Top level open for Claude Code compatibility (same reason as hookSpecificOutput): unknown fields are ignored.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-output.schema.json"
+    }
+  ],
+  "required": [],
+  "properties": {},
+  "additionalProperties": true
+}

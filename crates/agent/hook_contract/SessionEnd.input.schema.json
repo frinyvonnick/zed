@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/SessionEnd.input.schema.json",
+  "title": "SessionEnd input",
+  "description": "Fires when Zed releases an agent conversation object (gpui observe_release). Notification only; may fire late.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "reason"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "SessionEnd"
+    },
+    "reason": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:3570). Zed always sends \"other\".",
+      "enum": [
+        "clear",
+        "resume",
+        "logout",
+        "prompt_input_exit",
+        "other"
+      ]
+    }
+  },
+  "unevaluatedProperties": false
+}

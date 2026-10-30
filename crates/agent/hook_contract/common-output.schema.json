@@ -9,7 +9,7 @@
   "properties": {
     "continue": {
       "type": "boolean",
-      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1068). In Claude Code, false stops Claude entirely. In Zed it is a PAUSE, not a cut: the agent finishes its current turn, Zed shows `stopReason`, and the conversation waits for the user. Last resort only: a guard first denies with a reason (the model goes on another way), and asks for the pause only after repeated denials. Stops the hook chain of the event."
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1068). In Claude Code, false stops Claude entirely. In Zed it is a PAUSE, not a cut: the tool results already produced are kept, no further model request is sent, Zed shows `stopReason`, and the conversation waits for the user. Last resort only: a guard first denies with a reason (the model goes on another way), and asks for the pause only after repeated denials. On PreToolUse it also denies the tool, with `stopReason` as the reason, and stops the chain like any denial. On other events the chain runs to its end, then the pause applies."
     },
     "stopReason": {
       "type": "string",

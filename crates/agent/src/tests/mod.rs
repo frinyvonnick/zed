@@ -1809,6 +1809,897 @@ async fn test_released_thread_is_forgotten_by_model_hooks(cx: &mut TestAppContex
     assert_eq!(cx.update(crate::hooks::remembered_thread_count), 0);
 }
 
+/// A hook that answers with the next of its responses, then `{}`, and
+/// records its inputs.
+struct ScriptedHook {
+    responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl crate::hooks::HookHandler for ScriptedHook {
+    fn call(&self, input: serde_json::Value, _cx: &mut App) -> Task<Result<serde_json::Value>> {
+        self.calls.lock().unwrap().push(input);
+        let response = self.responses.lock().unwrap().pop_front();
+        Task::ready(Ok(response.unwrap_or_else(|| json!({}))))
+    }
+}
+
+fn scripted_hook(
+    responses: Vec<serde_json::Value>,
+) -> (
+    Arc<dyn crate::hooks::HookHandler>,
+    Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook = Arc::new(ScriptedHook {
+        responses: std::sync::Mutex::new(responses.into()),
+        calls: calls.clone(),
+    });
+    (hook, calls)
+}
+
+fn never_answering_hook() -> (
+    Arc<dyn crate::hooks::HookHandler>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+) {
+    let called = Arc::new(AtomicBool::new(false));
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let hook = Arc::new(NeverAnsweringHook {
+        called: called.clone(),
+        abandoned: abandoned.clone(),
+    });
+    (hook, called, abandoned)
+}
+
+/// The errors and the user messages the turn reported so far.
+fn turn_events(events: &mut UnboundedReceiver<Result<ThreadEvent>>) -> (Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut user_messages = Vec::new();
+    while let Some(Some(event)) = events.next().now_or_never() {
+        match event {
+            Err(error) => errors.push(format!("{error:#}")),
+            Ok(ThreadEvent::UserMessage(message)) => user_messages.push(message.to_markdown()),
+            Ok(_) => {}
+        }
+    }
+    (errors, user_messages)
+}
+
+/// The text of each message of the thread, by role, read from its markdown.
+fn thread_texts(thread: &Entity<Thread>, cx: &mut TestAppContext) -> Vec<String> {
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    let mut texts = Vec::<String>::new();
+    for line in markdown.lines() {
+        match line {
+            "## User" => texts.push("user:".into()),
+            "## Assistant" => texts.push("agent:".into()),
+            "" => {}
+            line => {
+                let text = texts.last_mut().expect("a message starts with its role");
+                text.push(' ');
+                text.push_str(line);
+            }
+        }
+    }
+    texts
+}
+
+#[gpui::test]
+async fn test_a_guard_denies_twice_then_pauses_the_turn(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let deny = || {
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Push to your branch instead.",
+            }
+        })
+    };
+    let mut pause = deny();
+    pause["continue"] = json!(false);
+    pause["stopReason"] = json!("Third forced push: your call.");
+    crate::hooks::tests::assert_matches_contract("PreToolUse.output.schema.json", &pause);
+    let (guard, _) = scripted_hook(vec![deny(), deny(), pause]);
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            pre_tool_use: hook_groups(vec![(Some(EchoTool::NAME), guard)]),
+            ..Default::default()
+        })
+    });
+    let runs = Arc::new(AtomicUsize::new(0));
+    thread.update(cx, |thread, _| {
+        thread.add_tool(CountingEchoTool(runs.clone()))
+    });
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Force push to main"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // The first two denials send the model on another way.
+    for _ in 0..2 {
+        send_echo_tool_use(&fake, &model);
+        cx.run_until_parked();
+        assert_eq!(
+            last_tool_result(&fake).content,
+            vec!["Push to your branch instead.".into()]
+        );
+    }
+    // The third one also pauses: the denial is recorded, and no request follows.
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+
+    assert!(fake.pending_completions().is_empty());
+    let (errors, user_messages) = turn_events(&mut events);
+    assert!(errors.is_empty(), "{errors:?}");
+    let pause = "Paused by a hook: Third forced push: your call.";
+    assert_eq!(user_messages.last().map(|text| text.trim()), Some(pause));
+    let texts = thread_texts(&thread, cx);
+    assert_eq!(texts.last().unwrap(), &format!("user: {pause}"));
+    // All three denials are recorded.
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    assert_eq!(markdown.matches("**Tool Result**").count(), 3, "{markdown}");
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+
+    // The conversation waits for the user, then goes on normally.
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Push to my branch"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(fake.pending_completions().len(), 1);
+}
+
+#[gpui::test]
+async fn test_a_stop_hook_continues_the_turn_with_its_reason(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let block = json!({ "decision": "block", "reason": "Run the gate first." });
+    crate::hooks::tests::assert_matches_contract("Stop.output.schema.json", &block);
+    let (stop, calls) = scripted_hook(vec![block]);
+    // Stop has no matcher field: a matcher is ignored.
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            stop: hook_groups(vec![(Some("anything"), stop)]),
+            ..Default::default()
+        })
+    });
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Fix the test"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Fixed.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let request = fake
+        .pending_completions()
+        .pop()
+        .expect("the Stop hook continues the turn");
+    let feedback = "Stop hook feedback: Run the gate first.";
+    assert_eq!(request.messages.last().unwrap().string_contents(), feedback);
+    fake.send_last_text(&model, "Gate passed.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert!(fake.pending_completions().is_empty());
+    let (errors, user_messages) = turn_events(&mut events);
+    assert!(errors.is_empty(), "{errors:?}");
+    // The continuation shows live as it does once the conversation is reopened.
+    assert_eq!(
+        user_messages
+            .iter()
+            .map(|text| text.trim())
+            .collect::<Vec<_>>(),
+        vec![feedback]
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    for call in calls.iter() {
+        crate::hooks::tests::assert_matches_contract("Stop.input.schema.json", call);
+    }
+    assert_eq!(calls[0]["stop_hook_active"], false);
+    assert_eq!(calls[0]["last_assistant_message"], "Fixed.");
+    assert_eq!(calls[1]["stop_hook_active"], true);
+    assert_eq!(calls[1]["last_assistant_message"], "Gate passed.");
+}
+
+#[gpui::test]
+async fn test_a_stop_hook_pause_ends_the_turn(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let pause = json!({
+        "decision": "block",
+        "reason": "Run the gate first.",
+        "continue": false,
+        "stopReason": "Out of scope: waiting for you.",
+    });
+    crate::hooks::tests::assert_matches_contract("Stop.output.schema.json", &pause);
+    let (stop, _) = scripted_hook(vec![pause]);
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            stop: hook_groups(vec![(None, stop)]),
+            ..Default::default()
+        })
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Fix the test"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Fixed.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert!(fake.pending_completions().is_empty());
+    assert_eq!(
+        thread_texts(&thread, cx),
+        vec![
+            "user: Fix the test".to_string(),
+            "agent: Fixed.".to_string(),
+            "user: Paused by a hook: Out of scope: waiting for you.".to_string(),
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_cancelling_during_stop_hooks_abandons_them(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (stop, called, abandoned) = never_answering_hook();
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            stop: hook_groups(vec![(None, stop)]),
+            ..Default::default()
+        })
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Fix the test"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Fixed.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+    assert!(called.load(Ordering::SeqCst));
+
+    thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+    cx.run_until_parked();
+
+    assert!(abandoned.load(Ordering::SeqCst));
+    assert!(fake.pending_completions().is_empty());
+    assert_eq!(
+        thread_texts(&thread, cx),
+        vec![
+            "user: Fix the test".to_string(),
+            "agent: Fixed.".to_string()
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_stop_hooks_do_not_run_for_subagents(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let (stop, calls) = recording_hook(json!({ "decision": "block", "reason": "Again." }));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            stop: hook_groups(vec![(None, stop)]),
+            ..Default::default()
+        })
+    });
+    let send = test.send("Find the config", cx);
+    test.fake.send_last_text(&test.model, "Found it.");
+    test.fake.end_last(&test.model);
+    cx.run_until_parked();
+
+    assert_eq!(send.await.unwrap(), "Found it.");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+async fn test_a_subagent_pause_reaches_its_parent(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let (guard, _) = recording_hook(json!({ "continue": false, "stopReason": "Out of scope." }));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            pre_tool_use: hook_groups(vec![(Some(EchoTool::NAME), guard)]),
+            ..Default::default()
+        })
+    });
+    let send = test.send("Find the config", cx);
+    send_echo_tool_use(&test.fake, &test.model);
+    cx.run_until_parked();
+
+    let answer = send.await.unwrap();
+    assert!(
+        answer.contains("Paused by a hook: Out of scope."),
+        "{answer}"
+    );
+    assert!(test.fake.pending_completions().is_empty());
+    let parent_id = test
+        .parent
+        .read_with(cx, |parent, _| parent.id().to_string());
+    assert_eq!(
+        cx.update(|cx| crate::hooks::take_pause(&parent_id, cx))
+            .as_deref(),
+        Some("Out of scope.")
+    );
+}
+
+#[gpui::test]
+async fn test_user_prompt_submit_adds_context_to_the_prompt(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let output = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "Branch: feat/hooks",
+        }
+    });
+    crate::hooks::tests::assert_matches_contract("UserPromptSubmit.output.schema.json", &output);
+    let (submit, calls) = recording_hook(output);
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            user_prompt_submit: hook_groups(vec![(None, submit)]),
+            ..Default::default()
+        })
+    });
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Fix the test"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let request = fake
+        .pending_completions()
+        .pop()
+        .expect("the prompt is sent");
+    let context = "<system-reminder>\nUserPromptSubmit hook additional context: Branch: feat/hooks\n</system-reminder>";
+    let texts = request
+        .messages
+        .iter()
+        .rev()
+        .take(2)
+        .map(|message| message.string_contents())
+        .collect::<Vec<_>>();
+    assert_eq!(texts, vec![context.to_string(), "Fix the test".to_string()]);
+    // The context is a message of its own, live as once reopened.
+    let (_, user_messages) = turn_events(&mut events);
+    assert_eq!(
+        user_messages
+            .iter()
+            .map(|text| text.trim())
+            .collect::<Vec<_>>(),
+        vec![context]
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    crate::hooks::tests::assert_matches_contract("UserPromptSubmit.input.schema.json", &calls[0]);
+    assert_eq!(calls[0]["prompt"], "Fix the test");
+}
+
+#[gpui::test]
+async fn test_user_prompt_submit_is_not_run_again_on_a_retry(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let (submit, calls) = recording_hook(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "Branch: feat/hooks",
+        }
+    }));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            user_prompt_submit: hook_groups(vec![(None, submit)]),
+            ..Default::default()
+        })
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Fix the test"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+    cx.run_until_parked();
+
+    thread
+        .update(cx, |thread, cx| thread.send_existing(cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let request = fake.pending_completions().pop().expect("the retry is sent");
+    let contexts = request
+        .messages
+        .iter()
+        .filter(|message| message.string_contents().contains("Branch: feat/hooks"))
+        .count();
+    assert_eq!(contexts, 1);
+}
+
+#[gpui::test]
+async fn test_user_prompt_submit_block_replaces_the_message(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let (submit, _) = recording_hook(json!({
+        "decision": "block",
+        "reason": "No tokens in prompts.",
+    }));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            user_prompt_submit: hook_groups(vec![(None, submit)]),
+            ..Default::default()
+        })
+    });
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["My token is abc"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    assert!(fake.pending_completions().is_empty());
+    let blocked = "Message blocked by a UserPromptSubmit hook: No tokens in prompts.";
+    let (errors, user_messages) = turn_events(&mut events);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        user_messages
+            .iter()
+            .map(|text| text.trim())
+            .collect::<Vec<_>>(),
+        vec![blocked]
+    );
+    assert_eq!(thread_texts(&thread, cx), vec![format!("user: {blocked}")]);
+}
+
+#[gpui::test]
+async fn test_cancelling_during_user_prompt_submit_abandons_it(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let (submit, called, abandoned) = never_answering_hook();
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            user_prompt_submit: hook_groups(vec![(None, submit)]),
+            ..Default::default()
+        })
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Fix the test"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(called.load(Ordering::SeqCst));
+
+    thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+    cx.run_until_parked();
+
+    assert!(abandoned.load(Ordering::SeqCst));
+    assert!(fake.pending_completions().is_empty());
+    assert_eq!(
+        thread_texts(&thread, cx),
+        vec!["user: Fix the test".to_string()]
+    );
+}
+
+#[gpui::test]
+async fn test_hook_messages_show_the_same_live_and_reopened(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let (submit, _) = scripted_hook(vec![
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "Branch: feat/hooks",
+            }
+        }),
+        json!({ "decision": "block", "reason": "No tokens in prompts." }),
+    ]);
+    let (stop, _) = scripted_hook(vec![json!({
+        "decision": "block",
+        "reason": "Run the gate first.",
+    })]);
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            user_prompt_submit: hook_groups(vec![(None, submit)]),
+            stop: hook_groups(vec![(None, stop)]),
+            ..Default::default()
+        })
+    });
+    let send = test._acp_thread.update(cx, |thread, cx| {
+        thread.send(vec!["Fix the test".into()], cx)
+    });
+    cx.run_until_parked();
+    test.fake.send_last_text(&test.model, "Fixed.");
+    test.fake.end_last(&test.model);
+    cx.run_until_parked();
+    test.fake.send_last_text(&test.model, "Gate passed.");
+    test.fake.end_last(&test.model);
+    cx.run_until_parked();
+    send.await.unwrap();
+    let send = test._acp_thread.update(cx, |thread, cx| {
+        thread.send(vec!["My token is abc".into()], cx)
+    });
+    cx.run_until_parked();
+    send.await.unwrap();
+
+    let live = test
+        ._acp_thread
+        .read_with(cx, |thread, cx| thread.to_markdown(cx));
+    assert!(
+        live.contains("Stop hook feedback: Run the gate first."),
+        "{live}"
+    );
+    assert!(
+        live.contains("UserPromptSubmit hook additional context"),
+        "{live}"
+    );
+    assert!(!live.contains("My token is abc"), "{live}");
+
+    let session_id = test
+        ._acp_thread
+        .read_with(cx, |thread, _| thread.session_id().clone());
+    let project = test
+        .parent
+        .read_with(cx, |thread, _| thread.project.clone());
+    let SubagentCompactionTest {
+        _agent: agent,
+        _acp_thread,
+        parent,
+        thread,
+        environment,
+        handle,
+        ..
+    } = test;
+    drop((_acp_thread, parent, thread, environment, handle));
+    cx.run_until_parked();
+    release_dropped_entities(cx);
+    let reopened = agent
+        .update(cx, |agent, cx| agent.open_thread(session_id, project, cx))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reopened.read_with(cx, |thread, cx| thread.to_markdown(cx)),
+        live
+    );
+}
+
+#[gpui::test]
+async fn test_session_hooks_run_when_a_conversation_opens_and_closes(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (start, start_calls) = recording_hook(json!({}));
+    let (end, end_calls) = recording_hook(json!({}));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            session_start: hook_groups(vec![(Some("startup"), start)]),
+            session_end: hook_groups(vec![(Some("other"), end)]),
+            ..Default::default()
+        })
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+    let store = cx.new(ThreadStore::new);
+    let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| connection.new_session(project, PathList::new(&[Path::new("")]), cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let start_input = {
+        let calls = start_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        crate::hooks::tests::assert_matches_contract("SessionStart.input.schema.json", &calls[0]);
+        assert_eq!(calls[0]["source"], "startup");
+        calls[0].clone()
+    };
+    assert!(end_calls.lock().unwrap().is_empty());
+    // A pause still pending when the conversation goes away is forgotten.
+    let thread_id = start_input["zed"]["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cx.update(|cx| crate::hooks::record_pause(&thread_id, "Out of scope.", cx));
+
+    drop(acp_thread);
+    // Releases are handled when the next update ends.
+    cx.update(|_| {});
+    cx.run_until_parked();
+
+    let calls = end_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    crate::hooks::tests::assert_matches_contract("SessionEnd.input.schema.json", &calls[0]);
+    assert_eq!(calls[0]["reason"], "other");
+    assert_eq!(
+        calls[0]["zed"]["thread_id"],
+        start_input["zed"]["thread_id"]
+    );
+    assert_eq!(
+        cx.update(|cx| crate::hooks::take_pause(&thread_id, cx)),
+        None
+    );
+}
+
+#[gpui::test]
+async fn test_session_hooks_do_not_run_for_subagents(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let (start, start_calls) = recording_hook(json!({}));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            session_start: hook_groups(vec![(None, start)]),
+            ..Default::default()
+        })
+    });
+
+    cx.update(|cx| {
+        test.environment
+            .create_subagent_thread("explorer".to_string(), None, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    assert!(start_calls.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+async fn test_a_paused_subagent_answers_its_parent_with_the_pause(cx: &mut TestAppContext) {
+    let fake = init_test(cx);
+    cx.update(|cx| cx.update_flags(true, vec!["subagents".to_string()]));
+    let (guard, _) = recording_hook(json!({ "continue": false, "stopReason": "Out of scope." }));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            pre_tool_use: hook_groups(vec![(Some(ReadFileTool::NAME), guard)]),
+            ..Default::default()
+        })
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({ "a": { "b.md": "Lorem" } }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = fake.model("thread");
+    thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+    cx.run_until_parked();
+
+    let _send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Prompt".into()], cx)
+    });
+    cx.run_until_parked();
+    let spawn = SpawnAgentToolInput {
+        label: "explorer".to_string(),
+        message: "Read the notes".to_string(),
+        session_id: None,
+        model: None,
+    };
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "subagent_1".into(),
+            name: SpawnAgentTool::NAME.into(),
+            raw_input: serde_json::to_string(&spawn).unwrap(),
+            input: language_model::LanguageModelToolUseInput::Json(
+                serde_json::to_value(&spawn).unwrap(),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    // The subagent reads a file; the guard pauses it.
+    let read = json!({ "path": "a/b.md" });
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "read_1".into(),
+            name: ReadFileTool::NAME.into(),
+            raw_input: read.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(read),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert!(fake.pending_completions_for(&model).is_empty());
+    let texts = thread_texts(&thread, cx);
+    assert_eq!(
+        texts.last().unwrap(),
+        "user: Paused by a hook: Out of scope."
+    );
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    assert!(
+        !markdown.contains("No response from subagent"),
+        "{markdown}"
+    );
+    // Once as the spawn_agent result, once as the parent's own pause.
+    assert!(
+        markdown.matches("Paused by a hook: Out of scope.").count() >= 2,
+        "{markdown}"
+    );
+}
+
+#[gpui::test]
+async fn test_user_prompt_submit_is_not_run_again_when_the_same_message_is_retried(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (submit, calls) = recording_hook(json!({}));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            user_prompt_submit: hook_groups(vec![(None, submit)]),
+            ..Default::default()
+        })
+    });
+    let id = ClientUserMessageId::new();
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(id.clone(), ["Fix the test"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_error(&model, anyhow::anyhow!("boom"));
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    thread
+        .update(cx, |thread, cx| thread.send(id, ["Fix the test"], cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert!(!fake.pending_completions().is_empty());
+}
+
+#[gpui::test]
+async fn test_a_late_tool_result_finds_its_turn_past_hook_messages(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (submit, _) = recording_hook(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "Branch: feat/hooks",
+        }
+    }));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            user_prompt_submit: hook_groups(vec![(None, submit)]),
+            ..Default::default()
+        })
+    });
+    thread.update(cx, |thread, _| thread.add_tool(DelayTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Wait a bit"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let delay = json!({ "ms": 1000 });
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "delay_1".into(),
+            name: DelayTool::NAME.into(),
+            raw_input: delay.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(delay),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    // A new message cancels the turn while its tool still runs; like the
+    // native agent, the thread first freezes the old turn's message.
+    thread
+        .update(cx, |thread, cx| {
+            thread.prepare_local_turn(cx);
+            thread.send(ClientUserMessageId::new(), ["Never mind"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(1000));
+    cx.run_until_parked();
+
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    assert!(markdown.contains("Ding"), "{markdown}");
+}
+
+#[gpui::test]
+async fn test_tokens_before_a_message_skip_a_pause_message(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (guard, _) = recording_hook(json!({ "continue": false, "stopReason": "Out of scope." }));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            pre_tool_use: hook_groups(vec![(Some(EchoTool::NAME), guard)]),
+            ..Default::default()
+        })
+    });
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            ..TokenUsage::default()
+        }),
+    );
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+    // The pause message is the last one, and no request followed it.
+    let next = ClientUserMessageId::new();
+    thread
+        .update(cx, |thread, cx| thread.send(next.clone(), ["Next"], cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(
+        thread.read_with(cx, |thread, _| thread.tokens_before_message(&next)),
+        Some(100)
+    );
+}
+
 /// A hook that answers with the next of its responses, then `{}`.
 struct SequenceHook {
     responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,

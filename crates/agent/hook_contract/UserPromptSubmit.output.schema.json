@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/UserPromptSubmit.output.schema.json",
+  "title": "UserPromptSubmit output",
+  "description": "Can block the prompt or add context. Top level open for Claude Code compatibility (same reason as hookSpecificOutput): unknown fields are ignored.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-output.schema.json"
+    }
+  ],
+  "required": [],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1530). Only value: \"block\". Blocks the prompt; `reason` is shown to the user.",
+      "enum": [
+        "block"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1531). Why the prompt is blocked; shown to the user, not added to context."
+    },
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "Event-specific output. Open for Claude Code compatibility: Claude Code adds fields here across versions, and a script shared with Claude Code must not be rejected by Zed for a field Zed does not know. Unknown fields are ignored.",
+      "additionalProperties": true,
+      "required": [
+        "hookEventName"
+      ],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1064). Must be this event name; in Zed a mismatch is a hook failure.",
+          "const": "UserPromptSubmit"
+        },
+        "additionalContext": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1305). Text added to the model context."
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

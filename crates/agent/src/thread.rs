@@ -2224,6 +2224,22 @@ impl Thread {
         self.messages.last().map(std::ops::Deref::deref)
     }
 
+    /// The last message before the ones hooks added at the end, such as a
+    /// pause, and those.
+    pub(crate) fn split_trailing_hook_messages(&self) -> (Option<&Message>, Vec<&UserMessage>) {
+        let split = self.messages.iter().rposition(|message| {
+            !matches!(&**message, Message::User(user) if crate::hooks::is_hook_message(&user.id))
+        });
+        let trailing = self.messages[split.map_or(0, |ix| ix + 1)..]
+            .iter()
+            .filter_map(|message| match &**message {
+                Message::User(user) => Some(user),
+                _ => None,
+            })
+            .collect();
+        (split.map(|ix| &*self.messages[ix]), trailing)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn last_received_or_pending_message(&self) -> Option<Arc<Message>> {
         if let Some(message) = self.pending_message.clone() {
@@ -2580,6 +2596,13 @@ impl Thread {
                     let prev_id = previous_user_message_id?;
                     let usage = self.request_token_usage.get(prev_id)?;
                     return Some(total_input_tokens(*usage));
+                }
+                // A message a hook added after the last request, such as a
+                // pause, has no usage of its own.
+                if crate::hooks::is_hook_message(&user_msg.id)
+                    && !self.request_token_usage.contains_key(&user_msg.id)
+                {
+                    continue;
                 }
                 previous_user_message_id = Some(&user_msg.id);
             }
@@ -2960,6 +2983,18 @@ impl Thread {
         let mut intent = CompletionIntent::UserPrompt;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<LanguageModel> = None;
+        if !crate::hooks::before_turn(
+            this,
+            event_stream,
+            user_message_id,
+            cancellation_rx.clone(),
+            cx,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let mut stop_hook_active = false;
         loop {
             if *cancellation_rx.borrow() {
                 return Ok(());
@@ -3315,6 +3350,9 @@ impl Thread {
                 return Ok(());
             }
 
+            if crate::hooks::pause_turn(this, event_stream, cx)? {
+                return Ok(());
+            }
             if let Some(error) = error {
                 attempt += 1;
                 match Self::retry_completion_error(
@@ -3342,7 +3380,19 @@ impl Thread {
                     }
                 })?;
             } else if end_turn {
-                return Ok(());
+                if !crate::hooks::continue_after_stop(
+                    this,
+                    event_stream,
+                    &mut stop_hook_active,
+                    cancellation_rx.clone(),
+                    cx,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                intent = CompletionIntent::UserPrompt;
+                attempt = 0;
             } else {
                 let end_at_boundary =
                     this.update(cx, |this, _| this.end_turn_at_next_boundary())?;
@@ -3588,7 +3638,9 @@ impl Thread {
             };
             let owning_user_message = this.messages.iter().take(owning_message_ix).rev().find_map(
                 |message| match message.as_ref() {
-                    Message::User(user) => Some(&user.id),
+                    Message::User(user) if !crate::hooks::is_hook_message(&user.id) => {
+                        Some(&user.id)
+                    }
                     _ => None,
                 },
             );
@@ -5711,7 +5763,7 @@ pub(crate) fn scoped_tool_call_id(
 }
 
 #[derive(Clone)]
-struct ThreadEventStream {
+pub(crate) struct ThreadEventStream {
     sender: mpsc::UnboundedSender<Result<ThreadEvent>>,
     active_compaction: Rc<RefCell<Option<acp_thread::ContextCompactionId>>>,
 }
@@ -5724,7 +5776,7 @@ impl ThreadEventStream {
         }
     }
 
-    fn send_user_message(&self, message: &UserMessage) {
+    pub(crate) fn send_user_message(&self, message: &UserMessage) {
         self.sender
             .unbounded_send(Ok(ThreadEvent::UserMessage(message.clone())))
             .ok();
