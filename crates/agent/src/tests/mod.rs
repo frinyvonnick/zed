@@ -3022,6 +3022,108 @@ async fn test_http_hook_from_settings_denies_tool_call(cx: &mut TestAppContext) 
     assert_eq!(runs.load(Ordering::SeqCst), 0);
 }
 
+/// The messages of the hook notices taken so far.
+fn hook_notice_messages(cx: &mut TestAppContext) -> Vec<String> {
+    cx.update(crate::take_hook_notices)
+        .into_iter()
+        .filter_map(|notice| notice.message)
+        .collect()
+}
+
+#[gpui::test]
+async fn test_a_code_2_on_post_compact_is_shown_to_the_user(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (post, _) = recording_hook(json!({ "decision": "block", "reason": "Summary too short." }));
+    cx.update(|cx| cx.set_global(compaction_hooks(Vec::new(), vec![post])));
+    start_automatic_compaction(&thread, &fake, &model, cx);
+    fake.send_last_text(&model, "summary");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert_eq!(
+        hook_notice_messages(cx),
+        vec!["PostCompact hook: Summary too short.".to_string()]
+    );
+}
+
+#[gpui::test]
+async fn test_a_code_2_on_session_hooks_is_shown_to_the_user(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (start, _) = recording_hook(json!({ "decision": "block", "reason": "Session log full." }));
+    let (end, _) = recording_hook(json!({ "decision": "block", "reason": "Could not archive." }));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            session_start: hook_groups(vec![(None, start)]),
+            session_end: hook_groups(vec![(None, end)]),
+            ..Default::default()
+        })
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+    let store = cx.new(ThreadStore::new);
+    let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| connection.new_session(project, PathList::new(&[Path::new("")]), cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    drop(acp_thread);
+    release_dropped_entities(cx);
+
+    assert_eq!(
+        hook_notice_messages(cx),
+        vec![
+            "SessionStart hook: Session log full.".to_string(),
+            "SessionEnd hook: Could not archive.".to_string(),
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_refused_hook_settings_are_shown_once_and_taken_away(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(crate::watch_hook_settings);
+    let set_hooks = |hooks: Option<serde_json::Value>, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().hooks = hooks;
+                });
+            });
+        });
+        cx.run_until_parked();
+    };
+    let refused = json!({ "PreToolUse": [{ "hooks": [{ "type": "prompt" }] }] });
+    set_hooks(Some(refused.clone()), cx);
+    set_hooks(Some(refused.clone()), cx);
+
+    let notices = cx.update(crate::take_hook_notices);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].source, crate::HOOK_SETTINGS_SOURCE);
+    let message = notices[0].message.clone().unwrap();
+    assert!(message.contains("PreToolUse[0].hooks[0]"), "{message}");
+    assert!(message.contains("prompt"), "{message}");
+
+    // Fixed: its message is taken away. Refused again: shown again.
+    set_hooks(None, cx);
+    assert_eq!(
+        cx.update(crate::take_hook_notices),
+        vec![crate::HookNotice {
+            source: crate::HOOK_SETTINGS_SOURCE.to_string(),
+            message: None,
+        }]
+    );
+    set_hooks(Some(refused), cx);
+    assert_eq!(hook_notice_messages(cx).len(), 1);
+}
+
 /// A hook that answers with the next of its responses, then `{}`.
 struct SequenceHook {
     responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,

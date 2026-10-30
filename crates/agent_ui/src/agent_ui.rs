@@ -792,6 +792,8 @@ pub fn init(
     })
     .detach();
 
+    init_hook_notices(cx);
+
     // Kick off the one-time migration of non-Default Rules to global
     // Skills. Test builds keep the old feature-flag deferral because
     // server flags are never received in `gpui::test` contexts, avoiding
@@ -810,6 +812,39 @@ pub fn init(
     }
 
     maybe_backfill_editor_layout(fs, is_new_install, cx);
+}
+
+/// Shows the messages agent hooks leave for the user as notifications: one
+/// per source, so that the last message of an event replaces the previous
+/// one, and a message of `None` takes it away.
+fn init_hook_notices(cx: &mut App) {
+    agent::watch_hook_settings(cx);
+    cx.observe_global::<agent::HookNotices>(show_hook_notices)
+        .detach();
+    // The observer starts later: messages queued before it, such as
+    // settings already refused when Zed starts, are shown now.
+    show_hook_notices(cx);
+}
+
+fn show_hook_notices(cx: &mut App) {
+    for notice in agent::take_hook_notices(cx) {
+        let id = workspace::notifications::NotificationId::composite::<agent::HookNotices>(
+            SharedString::from(notice.source),
+        );
+        let Some(message) = notice.message else {
+            workspace::notifications::dismiss_app_notification(&id, cx);
+            continue;
+        };
+        workspace::notifications::show_app_notification(id, cx, move |cx| {
+            gpui::AppContext::new(cx, |cx| {
+                workspace::notifications::simple_message_notification::MessageNotification::new(
+                    message.clone(),
+                    cx,
+                )
+                .copy_text(message.clone())
+            })
+        });
+    }
 }
 
 fn rerun_rules_to_skills_migration(
@@ -1383,5 +1418,49 @@ mod tests {
         assert_eq!(action.agent, Agent::NativeAgent.id());
 
         assert!(serde_json::from_str::<NewExternalAgentThread>(r#"{}"#).is_err());
+    }
+    #[gpui::test]
+    async fn test_hook_notices_show_one_notification_per_source(cx: &mut TestAppContext) {
+        crate::test_support::init_test(cx);
+        let set_hooks = |hooks: Option<serde_json::Value>, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |content| {
+                        content.agent.get_or_insert_default().hooks = hooks;
+                    });
+                });
+            });
+            cx.run_until_parked();
+        };
+        // Refused before the notices start, as when Zed starts with them.
+        set_hooks(
+            Some(serde_json::json!({ "PreToolUse": [{ "hooks": [{ "type": "prompt" }] }] })),
+            cx,
+        );
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        cx.update(init_hook_notices);
+        cx.run_until_parked();
+        let notifications = |cx: &mut TestAppContext| {
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids().len())
+        };
+        assert_eq!(notifications(cx), 1);
+
+        // Two messages of one event make one notification.
+        cx.update(|cx| {
+            agent::push_hook_notice("PreToolUse", "PreToolUse hook: first", cx);
+            agent::push_hook_notice("PreToolUse", "PreToolUse hook: second", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(notifications(cx), 2);
+
+        // Fixed settings take their notification away.
+        set_hooks(None, cx);
+        assert_eq!(notifications(cx), 1);
     }
 }

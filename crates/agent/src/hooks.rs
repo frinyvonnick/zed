@@ -1017,6 +1017,121 @@ fn log_unsupported_fields(output: &serde_json::Value) {
     }
 }
 
+/// Shows the user the reason of an event that has no decision to make, such
+/// as a code 2 on SessionStart, SessionEnd, SubagentStart or PostCompact.
+fn show_refusal_to_user(event: &str, output: &serde_json::Value, cx: &AsyncApp) {
+    if output["decision"] != "block" {
+        return;
+    }
+    let reason = output["reason"]
+        .as_str()
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or("no reason given");
+    let message = format!("{event} hook: {reason}");
+    cx.update(|cx| push_hook_notice(event, &message, cx));
+}
+
+/// Shows the user the `systemMessage` of an output Zed accepted, as Claude
+/// Code does; not on the compaction events, where Claude Code drops it too.
+fn show_system_message(event: &str, output: &serde_json::Value, cx: &AsyncApp) {
+    if matches!(event, "PreCompact" | "PostCompact") {
+        return;
+    }
+    if let Some(message) = output["systemMessage"]
+        .as_str()
+        .filter(|message| !message.trim().is_empty())
+    {
+        let message = format!("{event} hook: {message}");
+        cx.update(|cx| push_hook_notice(event, &message, cx));
+    }
+}
+
+/// An output Zed rejects: the user sees why, and not its `systemMessage`.
+fn reject_output(event: &str, error: impl std::fmt::Display, cx: &AsyncApp) {
+    let message = format!("{event} hook output ignored: {error:#}");
+    cx.update(|cx| push_hook_notice(event, &message, cx));
+}
+
+/// A message from hooks for the user. A message replaces the last one of the
+/// same `source`, so that hooks that run on every request cannot flood the
+/// screen; a `message` of `None` takes the last one away.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HookNotice {
+    pub source: String,
+    pub message: Option<String>,
+}
+
+/// The source of the messages about refused hook settings.
+pub const HOOK_SETTINGS_SOURCE: &str = "settings";
+
+/// The longest message shown; a longer one is cut.
+const MAX_HOOK_NOTICE_CHARS: usize = 2_000;
+
+/// Messages from hooks for the user, waiting for the interface to show them.
+#[derive(Default)]
+pub struct HookNotices {
+    pending: Vec<HookNotice>,
+    /// Why the hook settings are refused, already queued.
+    settings_error: Option<String>,
+}
+
+impl Global for HookNotices {}
+
+/// Queues a message for the user, and writes it to the log, which is all a
+/// run without a window, such as the eval CLI, keeps.
+pub fn push_hook_notice(source: &str, message: &str, cx: &mut App) {
+    let message = match message.char_indices().nth(MAX_HOOK_NOTICE_CHARS) {
+        Some((end, _)) => format!("{}… (truncated)", &message[..end]),
+        None => message.to_string(),
+    };
+    log::warn!("agent hook message for the user: {message}");
+    cx.default_global::<HookNotices>().pending.push(HookNotice {
+        source: source.to_string(),
+        message: Some(message),
+    });
+}
+
+/// Takes the messages waiting to be shown. It reads first, so that taking
+/// nothing does not wake the observers of the queue again.
+pub fn take_hook_notices(cx: &mut App) -> Vec<HookNotice> {
+    if cx
+        .try_global::<HookNotices>()
+        .is_none_or(|notices| notices.pending.is_empty())
+    {
+        return Vec::new();
+    }
+    std::mem::take(&mut cx.global_mut::<HookNotices>().pending)
+}
+
+/// Queues why the hook settings are refused, now and whenever they change;
+/// each refusal once, although every read of the settings repeats it. Once
+/// the settings load again, its message is taken away.
+pub fn watch_hook_settings(cx: &mut App) {
+    fn check(cx: &mut App) {
+        let error = AgentSettings::get_global(cx)
+            .hooks
+            .as_ref()
+            .and_then(|settings| AgentHooks::from_settings(settings, Path::new("")).err())
+            .map(|error| format!("Agent hooks are not loaded: {error:#}"));
+        let known = cx
+            .try_global::<HookNotices>()
+            .and_then(|notices| notices.settings_error.clone());
+        if error == known {
+            return;
+        }
+        cx.default_global::<HookNotices>().settings_error = error.clone();
+        match error {
+            Some(error) => push_hook_notice(HOOK_SETTINGS_SOURCE, &error, cx),
+            None => cx.default_global::<HookNotices>().pending.push(HookNotice {
+                source: HOOK_SETTINGS_SOURCE.to_string(),
+                message: None,
+            }),
+        }
+    }
+    check(cx);
+    cx.observe_global::<settings::SettingsStore>(check).detach();
+}
+
 /// The options of the question a `PreToolUse` ask puts to the user.
 const HOOK_ASK_ALLOW: &str = "allow";
 const HOOK_ASK_DENY: &str = "deny";
@@ -1193,7 +1308,7 @@ impl AnyAgentTool for HookedTool {
                         HookOutcome::Cancelled => return Err(cancelled_output()),
                     };
                     if let Err(error) = check_event_name("PreToolUse", &output) {
-                        log::warn!("PreToolUse hook output ignored: {error:#}");
+                        reject_output("PreToolUse", error, cx);
                         continue;
                     }
                     log_unsupported_fields(&output);
@@ -1203,6 +1318,7 @@ impl AnyAgentTool for HookedTool {
                     // with its reason and stops the chain, like any refusal.
                     if let Some(stop_reason) = requested_pause(&output) {
                         cx.update(|cx| record_pause(&self.context.thread_id, stop_reason, cx));
+                        show_system_message("PreToolUse", &output, cx);
                         notes.extend(context.map(str::to_string));
                         return Err(refused_output(stop_reason.to_string(), notes));
                     }
@@ -1214,6 +1330,7 @@ impl AnyAgentTool for HookedTool {
                         .filter(|reason| !reason.trim().is_empty());
                     match pre_tool_use_decision(&output) {
                         Some("deny") => {
+                            show_system_message("PreToolUse", &output, cx);
                             notes.extend(context.map(str::to_string));
                             let reason = reason.unwrap_or("A hook denied this tool call.");
                             return Err(refused_output(reason.to_string(), notes));
@@ -1235,12 +1352,17 @@ impl AnyAgentTool for HookedTool {
                         && !(updated_input.is_object()
                             && input_matches_schema(&self.inner.input_schema(), updated_input))
                     {
-                        log::warn!(
-                            "agent hook returned an updatedInput that does not match the {} tool's schema; the hook counts as failed",
-                            self.tool_name
+                        reject_output(
+                            "PreToolUse",
+                            format!(
+                                "its updatedInput does not match the {} tool's schema",
+                                self.tool_name
+                            ),
+                            cx,
                         );
                         continue;
                     }
+                    show_system_message("PreToolUse", &output, cx);
                     notes.extend(context.map(str::to_string));
                     if let Some(updated_input) = updated_input {
                         tool_input = updated_input.clone();
@@ -1317,10 +1439,11 @@ impl AnyAgentTool for HookedTool {
                     HookOutcome::Cancelled => break,
                 };
                 if let Err(error) = check_event_name("PostToolUse", &hook_output) {
-                    log::warn!("PostToolUse hook output ignored: {error:#}");
+                    reject_output("PostToolUse", error, cx);
                     continue;
                 }
                 log_unsupported_fields(&hook_output);
+                show_system_message("PostToolUse", &hook_output, cx);
                 if let Some(stop_reason) = requested_pause(&hook_output) {
                     cx.update(|cx| record_pause(&self.context.thread_id, stop_reason, cx));
                 }
@@ -1597,7 +1720,7 @@ impl ModelHooks {
                 }
             };
             if let Err(error) = check_event_name("PreCompact", &output) {
-                log::warn!("PreCompact hook output ignored: {error:#}");
+                reject_output("PreCompact", error, cx);
                 continue;
             }
             if output.get("decision").is_some_and(|value| !value.is_null()) {
@@ -1611,7 +1734,7 @@ impl ModelHooks {
             warn_on_unknown_zed_fields("PreCompact", &output, &["additional_instructions"]);
             match hook_text(&output, "/hookSpecificOutput/zed/additional_instructions") {
                 Ok(text) => instructions.extend(text.map(str::to_string)),
-                Err(error) => log::warn!("PreCompact hook output ignored: {error:#}"),
+                Err(error) => reject_output("PreCompact", error, cx),
             }
         }
         if !instructions.is_empty()
@@ -1708,10 +1831,11 @@ impl ModelHooks {
             }) {
                 Ok(fields) => fields,
                 Err(error) => {
-                    log::warn!("BeforeModel hook output ignored: {error:#}");
+                    reject_output("BeforeModel", error, cx);
                     continue;
                 }
             };
+            show_system_message("BeforeModel", &output, cx);
             // The hook took these messages: the next request sends it only the
             // ones that follow. After a failure, they are sent again.
             cx.update(|cx| {
@@ -1719,7 +1843,7 @@ impl ModelHooks {
                     .by_hook
                     .insert(sent_key, conversation_hashes.clone());
             });
-            log_unsupported_output_fields(&output, &["/continue", "/systemMessage"]);
+            log_unsupported_output_fields(&output, &["/continue"]);
             replace_tool_results(request, replacements);
             // The union of the lists of all hooks.
             for (removed, names) in [
@@ -1831,11 +1955,12 @@ impl ModelHooks {
             {
                 Ok(usage) => usage,
                 Err(error) => {
-                    log::warn!("AfterModel hook output ignored: {error:#}");
+                    reject_output("AfterModel", error, cx);
                     continue;
                 }
             };
-            log_unsupported_output_fields(&output, &["/continue", "/systemMessage"]);
+            show_system_message("AfterModel", &output, cx);
+            log_unsupported_output_fields(&output, &["/continue"]);
             if let Some(usage) = usage {
                 if let Some(fields) = event_fields.as_object_mut() {
                     fields.insert("usage".into(), usage_to_contract(&usage));
@@ -1943,14 +2068,14 @@ impl ErrorHooks {
             if let Err(error) = check_model_hook_output("ZedModelError", &output) {
                 log::warn!(
                     "ZedModelError hook output ignored (request {request_id}, status \
-                     {status:?}, category {}): {error:#}",
+                     {status:?}, category {})",
                     category_name(&category)
                 );
+                reject_output("ZedModelError", error, cx);
                 continue;
             }
-            // Deviation from the 0.1 contract: `systemMessage` is not shown to
-            // the user yet, only logged.
-            log_unsupported_output_fields(&output, &["/continue", "/systemMessage"]);
+            show_system_message("ZedModelError", &output, cx);
+            log_unsupported_output_fields(&output, &["/continue"]);
             let name = match output.pointer("/hookSpecificOutput/category") {
                 None | Some(serde_json::Value::Null) => continue,
                 Some(name) => name.as_str().unwrap_or_default(),
@@ -2159,17 +2284,12 @@ async fn run_post_compact(
             }
         };
         if let Err(error) = check_event_name("PostCompact", &output) {
-            log::warn!("PostCompact hook output ignored: {error:#}");
+            reject_output("PostCompact", error, cx);
             continue;
         }
-        // A code 2 arrives as a refusal: Claude Code shows its stderr to the
-        // user only.
-        if output.get("decision").is_some_and(|value| !value.is_null()) {
-            log::warn!(
-                "a PostCompact hook has no decision to make; ignored (reason: {})",
-                output["reason"].as_str().unwrap_or("none given")
-            );
-        }
+        // A code 2 arrives as a refusal: as Claude Code does, its stderr is
+        // shown to the user only.
+        show_refusal_to_user("PostCompact", &output, cx);
         log_unsupported_output_fields(&output, &UNSUPPORTED_COMPACTION_FIELDS);
         warn_on_unknown_zed_fields("PostCompact", &output, &["append_to_summary"]);
         match hook_text(&output, "/hookSpecificOutput/zed/append_to_summary") {
@@ -2178,7 +2298,7 @@ async fn run_post_compact(
                 passages.push(passage.to_string());
             }
             Ok(None) => {}
-            Err(error) => log::warn!("PostCompact hook output ignored: {error:#}"),
+            Err(error) => reject_output("PostCompact", error, cx),
         }
     }
     (!passages.is_empty()).then(|| passages.join("\n\n"))
@@ -3023,7 +3143,7 @@ async fn call_conversation_hook(
         }
     };
     if let Err(error) = check_event_name(event, &output) {
-        log::warn!("{event} hook output ignored: {error:#}");
+        reject_output(event, error, cx);
         return None;
     }
     if !output["decision"].is_null() && output["decision"] != "block" {
@@ -3032,6 +3152,7 @@ async fn call_conversation_hook(
             output["decision"]
         );
     }
+    show_system_message(event, &output, cx);
     Some(output)
 }
 
@@ -3109,7 +3230,6 @@ pub(crate) async fn before_turn(
         let Some(output) = output else {
             continue;
         };
-        log_unsupported_output_fields(&output, &["/systemMessage"]);
         // A pause lets the chain run to its end; a block stops it.
         if let Some(stop_reason) = requested_pause(&output) {
             pause = Some(stop_reason.to_string());
@@ -3225,10 +3345,7 @@ pub(crate) async fn continue_after_stop(
         let Some(output) = output else {
             continue;
         };
-        log_unsupported_output_fields(
-            &output,
-            &["/systemMessage", "/hookSpecificOutput/additionalContext"],
-        );
+        log_unsupported_output_fields(&output, &["/hookSpecificOutput/additionalContext"]);
         // The chain runs to its end, then the pause applies.
         if let Some(stop_reason) = requested_pause(&output) {
             pause = Some(stop_reason.to_string());
@@ -3321,8 +3438,7 @@ pub(crate) fn session_end(thread: &Entity<Thread>, cx: &mut App) {
 }
 
 /// Runs the hooks of a notification event in the background, in declaration
-/// order. Their output decides nothing: a code 2 is logged, until Zed can
-/// show it to the user.
+/// order. Their output decides nothing: a code 2 is shown to the user.
 fn notify_hooks(
     event: &'static str,
     hooks: Vec<Arc<dyn HookHandler>>,
@@ -3338,16 +3454,10 @@ fn notify_hooks(
             else {
                 continue;
             };
-            if output["decision"] == "block" {
-                log::warn!("{event} hook: {}", output["reason"].as_str().unwrap_or(""));
-            }
+            show_refusal_to_user(event, &output, cx);
             log_unsupported_output_fields(
                 &output,
-                &[
-                    "/continue",
-                    "/systemMessage",
-                    "/hookSpecificOutput/additionalContext",
-                ],
+                &["/continue", "/hookSpecificOutput/additionalContext"],
             );
         }
     })
@@ -3595,23 +3705,17 @@ async fn run_subagent_start(
             }
         };
         if let Err(error) = check_event_name("SubagentStart", &output) {
-            log::warn!("SubagentStart hook output ignored: {error:#}");
+            reject_output("SubagentStart", error, cx);
             continue;
         }
-        // A code 2 arrives as a refusal: Claude Code shows its stderr to the
-        // user only.
-        if output.get("decision").is_some_and(|value| !value.is_null()) {
-            log::warn!(
-                "a SubagentStart hook has no decision to make; ignored (reason: {})",
-                output["reason"].as_str().unwrap_or("none given")
-            );
-        }
+        // A code 2 arrives as a refusal: as Claude Code does, its stderr is
+        // shown to the user only.
+        show_refusal_to_user("SubagentStart", &output, cx);
         warn_on_unknown_zed_fields("SubagentStart", &output, &["deny_reason", "model"]);
         log_unsupported_output_fields(
             &output,
             &[
                 "/continue",
-                "/systemMessage",
                 "/stopReason",
                 // The model is chosen when Zed creates the subagent, before
                 // the hooks run.
@@ -3625,11 +3729,15 @@ async fn run_subagent_start(
             ))
         });
         match fields {
-            Ok((Some(reason), _)) => return Err(anyhow!(reason.to_string())),
-            Ok((None, note)) => notes.extend(note.map(str::to_string)),
-            Err(error) => {
-                log::warn!("SubagentStart hook output ignored, the subagent runs: {error:#}")
+            Ok((Some(reason), _)) => {
+                show_system_message("SubagentStart", &output, cx);
+                return Err(anyhow!(reason.to_string()));
             }
+            Ok((None, note)) => {
+                show_system_message("SubagentStart", &output, cx);
+                notes.extend(note.map(str::to_string));
+            }
+            Err(error) => reject_output("SubagentStart", error, cx),
         }
     }
     Ok(notes)
@@ -3665,14 +3773,14 @@ async fn run_subagent_stop(
             }
         };
         if let Err(error) = check_event_name("SubagentStop", &output) {
-            log::warn!("SubagentStop hook output ignored: {error:#}");
+            reject_output("SubagentStop", error, cx);
             continue;
         }
+        show_system_message("SubagentStop", &output, cx);
         log_unsupported_output_fields(
             &output,
             &[
                 "/continue",
-                "/systemMessage",
                 "/stopReason",
                 "/hookSpecificOutput/additionalContext",
             ],
@@ -7067,5 +7175,89 @@ pub(crate) mod tests {
         let allowed = vec!["TOKEN".to_string()];
         assert_eq!(interpolate_header("${A${OTHER}}", &allowed, lookup), "${A}");
         assert_eq!(interpolate_header("$$TOKEN", &allowed, lookup), "$secret");
+    }
+    fn notice(source: &str, message: &str) -> HookNotice {
+        HookNotice {
+            source: source.to_string(),
+            message: Some(message.to_string()),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_hook_notices_are_taken_once(cx: &mut TestAppContext) {
+        assert!(cx.update(take_hook_notices).is_empty());
+        cx.update(|cx| {
+            push_hook_notice("PreToolUse", "first", cx);
+            push_hook_notice("Stop", "second", cx);
+        });
+        assert_eq!(
+            cx.update(take_hook_notices),
+            vec![notice("PreToolUse", "first"), notice("Stop", "second")]
+        );
+        assert!(cx.update(take_hook_notices).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_a_long_hook_notice_is_cut(cx: &mut TestAppContext) {
+        assert_eq!(MAX_HOOK_NOTICE_CHARS, 2_000);
+        let long = "é".repeat(MAX_HOOK_NOTICE_CHARS + 10);
+        cx.update(|cx| push_hook_notice("Stop", &long, cx));
+        let message = cx.update(take_hook_notices)[0].message.clone().unwrap();
+        assert_eq!(
+            message,
+            format!("{}… (truncated)", "é".repeat(MAX_HOOK_NOTICE_CHARS))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_only_an_accepted_output_shows_its_system_message(cx: &mut TestAppContext) {
+        let (accepted, _) = fake_hook(Ok(json!({ "systemMessage": "Guard reloaded." })));
+        let (tool, _) = hooked_echo(vec![accepted], Vec::new());
+        run_echo(tool, "hello", cx).await;
+        assert_eq!(
+            cx.update(take_hook_notices),
+            vec![notice("PreToolUse", "PreToolUse hook: Guard reloaded.")]
+        );
+
+        // A rejected output shows why it was rejected, not its message.
+        let (rejected, _) = fake_hook(Ok(json!({
+            "systemMessage": "Should not show.",
+            "hookSpecificOutput": { "hookEventName": "PreToolUse", "updatedInput": { "text": 42 } },
+        })));
+        let (tool, _) = hooked_echo(vec![rejected], Vec::new());
+        run_echo(tool, "hello", cx).await;
+        let notices = cx.update(take_hook_notices);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let message = notices[0].message.clone().unwrap();
+        assert!(
+            message.contains("PreToolUse hook output ignored"),
+            "{message}"
+        );
+        assert!(message.contains("updatedInput"), "{message}");
+        assert!(!message.contains("Should not show."), "{message}");
+    }
+
+    #[gpui::test]
+    async fn test_a_code_2_on_subagent_start_is_shown_to_the_user(cx: &mut TestAppContext) {
+        let (start, _) = fake_hook(Ok(json!({ "decision": "block", "reason": "Quota low." })));
+        cx.update(|cx| cx.set_global(subagent_hooks(vec![(None, start)], Vec::new())));
+        let (environment, _) = hooked_environment(&["done"]);
+
+        spawn(&environment, "explorer", "Find the config", cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            cx.update(take_hook_notices),
+            vec![notice("SubagentStart", "SubagentStart hook: Quota low.")]
+        );
+
+        // Only a block is a refusal.
+        let (other, _) = fake_hook(Ok(json!({ "decision": "approve", "reason": "Fine." })));
+        cx.update(|cx| cx.set_global(subagent_hooks(vec![(None, other)], Vec::new())));
+        let (environment, _) = hooked_environment(&["done"]);
+        spawn(&environment, "explorer", "Find the config", cx)
+            .await
+            .unwrap();
+        assert!(cx.update(take_hook_notices).is_empty());
     }
 }

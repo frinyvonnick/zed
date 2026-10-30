@@ -15,6 +15,10 @@ mod tools;
 
 use context_server::ContextServerId;
 pub use db::*;
+pub use hooks::{
+    HOOK_SETTINGS_SOURCE, HookNotice, HookNotices, push_hook_notice, take_hook_notices,
+    watch_hook_settings,
+};
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
 use parking_lot::Mutex;
