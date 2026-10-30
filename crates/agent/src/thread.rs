@@ -8923,6 +8923,36 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_vllm_context_overflow_compacts_next_prompt(cx: &mut TestAppContext) {
+        let (thread, fake, model, _events) = start_turn_and_compact(cx).await;
+
+        fake.send_last_error(
+            &model,
+            LanguageModelCompletionError::from_http_status(
+                LanguageModelProviderName::new("vllm"),
+                http_client::StatusCode::BAD_REQUEST,
+                "This model's maximum context length is 122880 tokens. However, you requested 122880 output tokens and your prompt contains 302 characters (more than 0 characters, which is the upper bound for 0 input tokens). Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_text, value=302)".to_string(),
+                None,
+            ),
+        );
+        fake.end_last(&model);
+        cx.run_until_parked();
+        assert_eq!(fake.pending_completions(), Vec::new());
+
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["next prompt"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            last_pending_intent(&fake),
+            Some(CompletionIntent::ThreadContextSummarization)
+        );
+    }
+
+    #[gpui::test]
     async fn test_compaction_on_retry_inserts_summary_before_unanswered_prompt(
         cx: &mut TestAppContext,
     ) {

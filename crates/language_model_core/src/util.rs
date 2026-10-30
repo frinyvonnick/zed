@@ -50,14 +50,23 @@ pub fn parse_prompt_too_long(message: &str) -> Option<u64> {
 
 /// Recognizes OpenAI-style context window overflow errors, which arrive either
 /// with the `context_length_exceeded` error code or a "Your input exceeds the
-/// context window of this model" message.
+/// context window of this model" message. vLLM reports the same overflow as
+/// "This model's maximum context length is N tokens".
 pub fn is_context_window_exceeded_message(message: &str) -> bool {
-    message.contains("context_length_exceeded") || message.contains("exceeds the context window")
+    message.contains("context_length_exceeded")
+        || message.contains("exceeds the context window")
+        || message.contains("maximum context length")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_context_window_exceeded_message_recognizes_vllm() {
+        let message = "This model's maximum context length is 122880 tokens. However, you requested 122880 output tokens and your prompt contains 302 characters (more than 0 characters, which is the upper bound for 0 input tokens). Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_text, value=302)";
+        assert!(is_context_window_exceeded_message(message));
+    }
 
     #[test]
     fn test_fix_streamed_json_strips_incomplete_escape() {
