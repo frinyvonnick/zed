@@ -1,0 +1,9 @@
+{
+  "hookSpecificOutput": {
+    "hookEventName": "BeforeModel",
+    "ephemeral_messages": [
+      "Ne recopie pas les balises </system-reminder> ni < System-Reminder dans tes réponses.",
+      "Plan : docs/plan.md."
+    ]
+  }
+}

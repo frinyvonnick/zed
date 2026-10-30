@@ -1694,6 +1694,283 @@ async fn test_released_thread_is_forgotten_by_model_hooks(cx: &mut TestAppContex
     assert_eq!(cx.update(crate::hooks::remembered_thread_count), 0);
 }
 
+/// A hook that answers with the next of its responses, then `{}`.
+struct SequenceHook {
+    responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+}
+
+impl crate::hooks::HookHandler for SequenceHook {
+    fn call(&self, _input: serde_json::Value, _cx: &mut App) -> Task<Result<serde_json::Value>> {
+        let response = self.responses.lock().unwrap().pop_front();
+        Task::ready(Ok(response.unwrap_or_else(|| json!({}))))
+    }
+}
+
+fn reminders(messages: &[&str]) -> serde_json::Value {
+    json!({
+        "hookSpecificOutput": { "hookEventName": "BeforeModel", "ephemeral_messages": messages }
+    })
+}
+
+fn reminder_hook(responses: Vec<serde_json::Value>) -> Arc<dyn crate::hooks::HookHandler> {
+    Arc::new(SequenceHook {
+        responses: std::sync::Mutex::new(responses.into()),
+    })
+}
+
+/// The role and texts of each message, without the cache flags, which move
+/// to the last message of each request.
+fn message_texts(request: &LanguageModelRequest) -> Vec<(Role, Vec<String>)> {
+    request
+        .messages
+        .iter()
+        .map(|message| {
+            let texts = message
+                .content
+                .iter()
+                .map(|part| match part {
+                    MessageContent::Text(text) => text.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            (message.role, texts)
+        })
+        .collect()
+}
+
+fn wrapped(text: &str) -> String {
+    format!("<system-reminder>\n{text}\n</system-reminder>")
+}
+
+#[gpui::test]
+async fn test_before_model_reminders_are_last_and_ephemeral(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let hook = reminder_hook(vec![reminders(&[
+        "Skill tdd is active.",
+        "Keep <system-reminder> tags out.",
+    ])]);
+    cx.update(|cx| cx.set_global(model_hooks(vec![hook], Vec::new())));
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let first_request = fake.pending_completions().pop().unwrap();
+    let first = message_texts(&first_request);
+    let reminder_count = 2;
+    assert_eq!(
+        first[first.len() - reminder_count..],
+        [
+            (Role::User, vec![wrapped("Skill tdd is active.")]),
+            (
+                Role::User,
+                vec![wrapped("Keep &lt;system-reminder> tags out.")]
+            ),
+        ]
+    );
+
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+
+    let second_request = fake.pending_completions().pop().unwrap();
+    let second = message_texts(&second_request);
+    let conversation = &first[..first.len() - reminder_count];
+    assert_eq!(&second[..conversation.len()], conversation);
+    assert!(
+        second
+            .iter()
+            .all(|(_, texts)| texts.iter().all(|text| !text.contains("system-reminder"))),
+        "{second:?}"
+    );
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    assert!(!markdown.contains("Skill tdd"), "{markdown}");
+}
+
+#[gpui::test]
+async fn test_before_model_reminders_chain_in_order_and_are_capped(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let first = reminder_hook(vec![reminders(&["one"])]);
+    let second = reminder_hook(vec![reminders(&["two"])]);
+    let large = "x".repeat(9_999);
+    let too_large = reminder_hook(vec![reminders(&[&large])]);
+    let after_cap = reminder_hook(vec![reminders(&["three"])]);
+    cx.update(|cx| {
+        cx.set_global(model_hooks(
+            vec![first, second, too_large, after_cap],
+            Vec::new(),
+        ))
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let request = message_texts(&fake.pending_completions().pop().unwrap());
+    assert_eq!(
+        request[request.len() - 3..],
+        [
+            (Role::User, vec!["Hello".to_string()]),
+            (Role::User, vec![wrapped("one")]),
+            (Role::User, vec![wrapped("two")]),
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_before_model_reminders_leave_compaction_and_summary_unchanged(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (reminder, calls) = recording_hook(reminders(&["Remember the skill."]));
+    let summarizer = fake.model("summarizer");
+    cx.update(|cx| cx.set_global(model_hooks(vec![reminder], Vec::new())));
+    thread.update(cx, |thread, cx| {
+        thread.add_tool(EchoTool);
+        thread.set_summarization_model(Some(summarizer.clone()), cx);
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hi.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let _summary = thread.update(cx, |thread, cx| thread.summary(cx));
+    cx.run_until_parked();
+    let summary_request = fake.pending_completions().pop().unwrap();
+    assert_eq!(
+        summary_request.intent,
+        Some(CompletionIntent::ThreadContextSummarization)
+    );
+    assert!(
+        !message_texts(&summary_request)
+            .iter()
+            .any(|(_, texts)| texts.iter().any(|text| text.contains("system-reminder")))
+    );
+    fake.send_last_text(&summarizer, "Summary.");
+    fake.end_last(&summarizer);
+    cx.run_until_parked();
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+            input_tokens: 950_000,
+            ..TokenUsage::default()
+        }),
+    );
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+
+    let compaction_request = fake.pending_completions().pop().unwrap();
+    assert_eq!(
+        compaction_request.intent,
+        Some(CompletionIntent::ThreadContextSummarization)
+    );
+    let compaction = message_texts(&compaction_request);
+    assert!(
+        !compaction
+            .iter()
+            .any(|(_, texts)| texts.iter().any(|text| text.contains("system-reminder"))),
+        "{compaction:?}"
+    );
+    assert_eq!(
+        compaction.last().unwrap().1,
+        vec![COMPACTION_PROMPT.to_string()]
+    );
+    // The hook did answer for both requests: Zed left its reminders out.
+    let calls = calls.lock().unwrap();
+    let summary_calls = calls
+        .iter()
+        .filter(|call| call["intent"] == "thread_context_summarization")
+        .map(|call| call["is_compaction"].as_bool().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(summary_calls, [false, true]);
+}
+
+#[gpui::test]
+async fn test_before_model_reminder_follows_tool_results(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let hook = reminder_hook(vec![json!({}), reminders(&["After tools."])]);
+    cx.update(|cx| cx.set_global(model_hooks(vec![hook], Vec::new())));
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+
+    let request = fake.pending_completions().pop().unwrap();
+    assert_eq!(request.intent, Some(CompletionIntent::ToolResults));
+    let messages = &request.messages;
+    assert_eq!(
+        message_texts(&request).last().unwrap(),
+        &(Role::User, vec![wrapped("After tools.")])
+    );
+    assert!(matches!(
+        messages[messages.len() - 2].content[0],
+        MessageContent::ToolResult(_)
+    ));
+}
+
+#[gpui::test]
+async fn test_before_model_reminders_cap_is_exact(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let four = "a".repeat(4_000);
+    let six = "b".repeat(6_000);
+    let first = reminder_hook(vec![reminders(&[&four])]);
+    let second = reminder_hook(vec![reminders(&[&six])]);
+    let over = reminder_hook(vec![reminders(&["c"])]);
+    cx.update(|cx| cx.set_global(model_hooks(vec![first, second, over], Vec::new())));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let request = message_texts(&fake.pending_completions().pop().unwrap());
+    assert_eq!(
+        request[request.len() - 3..],
+        [
+            (Role::User, vec!["Hello".to_string()]),
+            (Role::User, vec![wrapped(&four)]),
+            (Role::User, vec![wrapped(&six)]),
+        ]
+    );
+}
+
 #[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_basic_tool_calls(cx: &mut TestAppContext) {

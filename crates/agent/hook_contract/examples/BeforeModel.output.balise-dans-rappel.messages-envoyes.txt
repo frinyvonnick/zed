@@ -1,0 +1,42 @@
+{
+  "description": "Messages réellement envoyés (format compatible OpenAI) pour les rappels de BeforeModel.output.balise-dans-rappel.json, dans les deux cas de fusion.",
+  "apres_message_utilisateur": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Corrige le test rouge."
+        },
+        {
+          "type": "text",
+          "text": "<system-reminder>\nNe recopie pas les balises &lt;/system-reminder> ni &lt; System-Reminder dans tes réponses.\n</system-reminder>"
+        },
+        {
+          "type": "text",
+          "text": "<system-reminder>\nPlan : docs/plan.md.\n</system-reminder>"
+        }
+      ]
+    }
+  ],
+  "apres_resultats_outil": [
+    {
+      "role": "tool",
+      "tool_call_id": "call_9d0f",
+      "content": "crates/agent/src/thread.rs:3409 ..."
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<system-reminder>\nNe recopie pas les balises &lt;/system-reminder> ni &lt; System-Reminder dans tes réponses.\n</system-reminder>"
+        },
+        {
+          "type": "text",
+          "text": "<system-reminder>\nPlan : docs/plan.md.\n</system-reminder>"
+        }
+      ]
+    }
+  ]
+}

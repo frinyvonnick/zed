@@ -107,6 +107,7 @@ language = { workspace = true, "features" = ["test-support"] }
 language_model = { workspace = true, "features" = ["test-support"] }
 language_models.workspace = true
 lsp = { workspace = true, "features" = ["test-support"] }
+open_ai.workspace = true
 pretty_assertions.workspace = true
 project = { workspace = true, "features" = ["test-support"] }
 proptest.workspace = true

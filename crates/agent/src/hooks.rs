@@ -24,7 +24,7 @@ use std::{
     hash::{DefaultHasher, Hash as _, Hasher as _},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -1106,6 +1106,9 @@ impl ModelHooks {
         let mut inserts = Vec::new();
         let mut insert_chars = 0;
         let mut capped = false;
+        let mut reminders = Vec::new();
+        let mut reminder_chars = 0;
+        let mut reminders_capped = false;
         for hook in &self.before_model {
             // Each hook gets the messages added since its own previous answer.
             let sent_key = (self.context.thread_id.clone(), hook_identity(hook));
@@ -1123,10 +1126,10 @@ impl ModelHooks {
                     continue;
                 }
             };
-            let insert = match check_model_hook_output("BeforeModel", &output)
-                .and_then(|()| system_prompt_insert(&output))
+            let (insert, hook_reminders) = match check_model_hook_output("BeforeModel", &output)
+                .and_then(|()| Ok((system_prompt_insert(&output)?, ephemeral_messages(&output)?)))
             {
-                Ok(insert) => insert,
+                Ok(fields) => fields,
                 Err(error) => {
                     log::warn!("BeforeModel hook output ignored: {error:#}");
                     continue;
@@ -1147,6 +1150,23 @@ impl ModelHooks {
                     "/hookSpecificOutput/tool_result_replacements",
                 ],
             );
+            if !hook_reminders.is_empty() {
+                // The cap applies to the reminders of all hooks together.
+                let added = hook_reminders
+                    .iter()
+                    .map(|reminder| reminder.chars().count())
+                    .sum::<usize>();
+                if reminders_capped || reminder_chars + added > MAX_SYSTEM_PROMPT_INSERT_CHARS {
+                    reminders_capped = true;
+                    log::warn!(
+                        "BeforeModel reminders exceed {MAX_SYSTEM_PROMPT_INSERT_CHARS} \
+                         characters together; the reminders of this hook are ignored"
+                    );
+                } else {
+                    reminder_chars += added;
+                    reminders.extend(hook_reminders.into_iter().map(str::to_string));
+                }
+            }
             let Some(insert) = insert else {
                 continue;
             };
@@ -1163,6 +1183,13 @@ impl ModelHooks {
             }
             insert_chars += added;
             inserts.push(insert.to_string());
+        }
+        // Reminders go last, in this request only: the conversation stays an
+        // identical prefix from one request to the next. Summaries get none.
+        if applies_ephemeral_messages(request) {
+            request
+                .messages
+                .extend(reminders.iter().map(|reminder| reminder_message(reminder)));
         }
         // A request without a system message (the panel summary) has no place
         // for the text.
@@ -1430,9 +1457,9 @@ fn is_compaction_request(request: &LanguageModelRequest) -> bool {
 }
 
 /// Whether a `system_prompt_insert` applies to this request: not to the
-/// compaction summary.
+/// compaction summary, nor to the title.
 fn applies_system_prompt_insert(request: &LanguageModelRequest) -> bool {
-    !is_compaction_request(request)
+    !is_compaction_request(request) && request.intent != Some(CompletionIntent::ThreadSummarization)
 }
 
 /// The contract's names of the intents a model hook can match.
@@ -1530,6 +1557,60 @@ fn message_to_contract(message: &LanguageModelRequestMessage) -> serde_json::Val
         })
         .collect::<Vec<_>>();
     json!({ "role": role, "content": content })
+}
+
+/// The `ephemeral_messages` of a `BeforeModel` output: texts for the last
+/// position of this request only.
+fn ephemeral_messages(output: &serde_json::Value) -> Result<Vec<&str>> {
+    let messages = match output.pointer("/hookSpecificOutput/ephemeral_messages") {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(messages) => messages
+            .as_array()
+            .context("`ephemeral_messages` must be a list of texts")?,
+    };
+    messages
+        .iter()
+        .map(|message| {
+            let text = message
+                .as_str()
+                .context("`ephemeral_messages` must be a list of texts")?;
+            anyhow::ensure!(!text.is_empty(), "an `ephemeral_messages` text is empty");
+            let length = text.chars().count();
+            anyhow::ensure!(
+                length <= MAX_SYSTEM_PROMPT_INSERT_CHARS,
+                "an `ephemeral_messages` text has {length} characters, more than \
+                 {MAX_SYSTEM_PROMPT_INSERT_CHARS}"
+            );
+            Ok(text)
+        })
+        .collect()
+}
+
+/// Whether `ephemeral_messages` apply to this request.
+/// Not to the title, the panel summary, nor the compaction.
+fn applies_ephemeral_messages(request: &LanguageModelRequest) -> bool {
+    !matches!(
+        request.intent,
+        Some(CompletionIntent::ThreadSummarization | CompletionIntent::ThreadContextSummarization)
+    )
+}
+
+/// A reminder as Zed sends it: a user message wrapped in `<system-reminder>`.
+/// The role is `user`: vLLM refuses a `system` message after the first one.
+/// Like Claude Code, a `<system-reminder>` tag inside the text is neutralised.
+fn reminder_message(text: &str) -> LanguageModelRequestMessage {
+    // Stricter than Claude Code: any case, and spaces inside the tag.
+    static TAG: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)<(\s*/?\s*system-reminder)").unwrap());
+    let text = TAG.replace_all(text, "&lt;$1");
+    LanguageModelRequestMessage {
+        role: Role::User,
+        content: vec![MessageContent::Text(format!(
+            "<system-reminder>\n{text}\n</system-reminder>"
+        ))],
+        cache: false,
+        reasoning_details: None,
+    }
 }
 
 /// The `system_prompt_insert` of a `BeforeModel` output. An empty text, or
@@ -2836,5 +2917,163 @@ pub(crate) mod tests {
         .expect("events Zed does not run yet must be refused")
         .to_string();
         assert!(error.contains("Stop"), "{error}");
+    }
+
+    #[test]
+    fn test_ephemeral_messages_are_validated() {
+        let output = |messages: serde_json::Value| {
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "BeforeModel",
+                    "ephemeral_messages": messages,
+                }
+            })
+        };
+
+        assert_eq!(ephemeral_messages(&json!({})).unwrap(), Vec::<&str>::new());
+        let two = output(json!(["Skill tdd is active.", "Compacted."]));
+        assert_eq!(
+            ephemeral_messages(&two).unwrap(),
+            vec!["Skill tdd is active.", "Compacted."]
+        );
+        assert!(ephemeral_messages(&output(json!("not a list"))).is_err());
+        assert!(ephemeral_messages(&output(json!([""]))).is_err());
+        assert!(ephemeral_messages(&output(json!([42]))).is_err());
+        assert!(ephemeral_messages(&output(json!(["x".repeat(10_000)]))).is_ok());
+        assert!(ephemeral_messages(&output(json!(["x".repeat(10_001)]))).is_err());
+    }
+
+    #[test]
+    fn test_reminder_message_wraps_and_escapes_the_text() {
+        let message = reminder_message("Read <system-reminder>this</system-reminder> again.");
+
+        assert_eq!(message.role, Role::User);
+        assert!(!message.cache);
+        assert_eq!(
+            text_of(&message),
+            "<system-reminder>\nRead &lt;system-reminder>this&lt;/system-reminder> again.\n</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn test_reminder_escaping_ignores_case_and_spaces() {
+        let message = reminder_message(
+            "a < /SYSTEM-REMINDER > b <System-Reminder> c <\tsystem-reminder d </ system-reminder>",
+        );
+
+        assert_eq!(
+            text_of(&message),
+            "<system-reminder>\na &lt; /SYSTEM-REMINDER > b &lt;System-Reminder> c &lt;\tsystem-reminder d &lt;/ system-reminder>\n</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn test_titles_and_summaries_get_no_insert_nor_reminders() {
+        let request = |intent: CompletionIntent, last: &str| LanguageModelRequest {
+            intent: Some(intent),
+            messages: vec![
+                message(Role::System, vec!["You are Zed.".into()]),
+                message(Role::User, vec![last.into()]),
+            ],
+            ..Default::default()
+        };
+        let title = request(CompletionIntent::ThreadSummarization, "Title?");
+        let panel_summary = request(CompletionIntent::ThreadContextSummarization, "Summarize.");
+        let compaction = request(
+            CompletionIntent::ThreadContextSummarization,
+            COMPACTION_PROMPT,
+        );
+
+        assert!(!applies_system_prompt_insert(&title));
+        assert!(!applies_system_prompt_insert(&compaction));
+        for excluded in [&title, &panel_summary, &compaction] {
+            assert!(
+                !applies_ephemeral_messages(excluded),
+                "{:?}",
+                excluded.intent
+            );
+        }
+        for included in [CompletionIntent::UserPrompt, CompletionIntent::ToolResults] {
+            assert!(applies_ephemeral_messages(&request(included, "Hello")));
+        }
+    }
+
+    #[test]
+    fn test_reminders_take_the_shape_the_openai_conversion_sends() {
+        // `examples/BeforeModel.output.balise-dans-rappel.json` and the two
+        // shapes really sent, in the hook contract.
+        let output: serde_json::Value = serde_json::from_str(include_str!(
+            "../hook_contract/examples/BeforeModel.output.balise-dans-rappel.json"
+        ))
+        .unwrap();
+        let sent: serde_json::Value = serde_json::from_str(include_str!(
+            "../hook_contract/examples/BeforeModel.output.balise-dans-rappel.messages-envoyes.txt"
+        ))
+        .unwrap();
+        let reminders = ephemeral_messages(&output)
+            .unwrap()
+            .into_iter()
+            .map(reminder_message)
+            .collect::<Vec<_>>();
+        let convert = |mut messages: Vec<LanguageModelRequestMessage>| {
+            messages.extend(reminders.iter().cloned());
+            let request = open_ai::completion::into_open_ai(
+                LanguageModelRequest {
+                    messages,
+                    ..Default::default()
+                },
+                "qwen",
+                true,
+                false,
+                None,
+                open_ai::completion::ChatCompletionMaxTokensParameter::MaxTokens,
+                None,
+                false,
+            )
+            .unwrap();
+            serde_json::to_value(request.messages).unwrap()
+        };
+
+        // After the user's message, the reminders become parts of it.
+        let after_prompt = convert(vec![
+            message(Role::System, vec!["You are Zed.".into()]),
+            message(Role::User, vec!["Corrige le test rouge.".into()]),
+        ]);
+        assert_eq!(
+            after_prompt.as_array().unwrap()[1..],
+            sent["apres_message_utilisateur"].as_array().unwrap()[..]
+        );
+
+        // After tool results, the first reminder opens a user message.
+        let after_tools = convert(vec![
+            message(Role::System, vec!["You are Zed.".into()]),
+            message(Role::User, vec!["Où est le délai ?".into()]),
+            message(
+                Role::Assistant,
+                vec![MessageContent::ToolUse(LanguageModelToolUse {
+                    id: "call_9d0f".into(),
+                    name: "grep".into(),
+                    raw_input: r#"{"regex":"timeout"}"#.into(),
+                    input: LanguageModelToolUseInput::Json(json!({ "regex": "timeout" })),
+                    is_input_complete: true,
+                    thought_signature: None,
+                })],
+            ),
+            message(
+                Role::User,
+                vec![MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "call_9d0f".into(),
+                    tool_name: "grep".into(),
+                    is_error: false,
+                    content: vec!["crates/agent/src/thread.rs:3409 ...".into()],
+                    output: None,
+                })],
+            ),
+        ]);
+        let after_tools = after_tools.as_array().unwrap();
+        assert_eq!(
+            after_tools[after_tools.len() - 2..],
+            sent["apres_resultats_outil"].as_array().unwrap()[..]
+        );
     }
 }

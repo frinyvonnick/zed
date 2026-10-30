@@ -58,6 +58,16 @@
           "description": "Text inserted into the system message of THIS request only, right before the `## System Information` heading of the Zed template (crates/agent/src/templates/system_prompt.hbs:144); if that heading is not found, at the end of the system message, and Zed writes a log line. Several hooks: texts are joined in declaration order (chain rule), separated by a blank line. The hook MUST return the same text from one request to the next while its inputs do not change: the server reuses the cached prompt prefix, and a text that changes (time, counter, random order) invalidates that cache on every request. Ignored for the compaction request (is_compaction true). At most 10000 characters for the JOINED text of all hooks of one request, the cap Claude Code puts on additionalContext (sources/claude-code-2026-10-30.md:1054): the text is resent with every request and counts in the context window. Beyond it, the inserts of the following hooks are ignored and logged.",
           "minLength": 1,
           "maxLength": 10000
+        },
+        "ephemeral_messages": {
+          "type": "array",
+          "description": "Zed extension. Texts that Zed appends at the LAST position of THIS request, each wrapped in <system-reminder> ... </system-reminder>, the wrapper Claude Code uses for hook context (sources/claude-code-2026-10-30.md:1117). Role user (role system at the end is refused by vLLM, measured 30/10). The OpenAI-compatible conversion of Zed merges consecutive user messages (crates/open_ai/src/completion.rs:712-725 at zed@422b53c): when the request ends with the user message, each reminder becomes a content part of THAT message; after tool results, the first reminder opens a user message and the next ones are its parts. The reminders stay last either way. Escaping: any <system-reminder or </system-reminder prefix in the text, case-insensitive and tolerant of spaces inside the tag, without requiring the closing >, has its < replaced by &lt; before wrapping. Stricter than Claude Code, which documents the exact tags (sources/claude-code-2026-10-30.md:1140). Never kept in the conversation: the next request no longer contains them. Several hooks: chained in declaration order. At most 10000 characters of raw reminder text per request, counted before escaping and wrapping; beyond, the reminders of the following hooks are ignored and logged. Ignored for the compaction request, the panel summary and the conversation title (thread_summarization). Zed calls BeforeModel again on each retry of the same request: a one-shot reminder must clear its state in AfterModel, after the response, not in BeforeModel.",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000,
+            "description": "Raw text of one reminder, without the wrapper (Zed adds it)."
+          }
         }
       }
     }
