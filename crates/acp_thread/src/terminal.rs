@@ -989,6 +989,151 @@ pub(crate) fn disable_pagers_through_env(env: &mut collections::HashMap<String, 
     env.insert("GIT_PAGER".into(), "cat".into());
 }
 
+/// Local patch (eval bench): MXC. Builds `wxc-exec.exe --config-base64 <policy> -- <sh.exe> -c
+/// <command>` for one agent command when `shell` is a POSIX shell (busybox, whose folder is then
+/// readable), else `-- powershell.exe ... -EncodedCommand <script>`. The policy grants write access to the
+/// project's worktrees only, read access to the tools listed in `ZED_EVAL_MXC_READONLY`
+/// (`;`-separated, defaults to Git, Node.js and the user's `.gitconfig`), and no network. Only the
+/// environment variables Zed changed are passed; the rest is MXC's default environment. The
+/// script is UTF-16LE base64 (`-EncodedCommand`), so quotes, pipes and new lines need no escaping.
+pub(crate) fn mxc_wrap_command(
+    mxc_exec: &str,
+    shell: &str,
+    command: &str,
+    cwd: Option<&std::path::Path>,
+    writable_paths: &[PathBuf],
+    env: &collections::HashMap<String, String>,
+) -> (String, Vec<String>) {
+    use base64::Engine as _;
+
+    let posix_shell = util::shell::ShellKind::new(shell, true) == util::shell::ShellKind::Posix;
+    let mut readonly_paths: Vec<String> = match std::env::var("ZED_EVAL_MXC_READONLY") {
+        Ok(list) => list
+            .split(';')
+            .filter(|path| !path.trim().is_empty())
+            .map(|path| path.trim().to_string())
+            .collect(),
+        Err(_) => {
+            let mut paths = vec![
+                "C:\\Program Files\\Git".to_string(),
+                "C:\\Program Files\\nodejs".to_string(),
+            ];
+            if let Some(profile) = std::env::var_os("USERPROFILE") {
+                let profile = PathBuf::from(profile);
+                for path in [profile.join(".gitconfig"), profile.join(".config\\git")] {
+                    if path.exists() {
+                        paths.push(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            paths
+        }
+    };
+    if posix_shell {
+        if let Some(folder) = std::path::Path::new(shell).parent() {
+            readonly_paths.push(folder.to_string_lossy().into_owned());
+        }
+    }
+    let mut changed_env: Vec<String> = env
+        .iter()
+        .filter(|(name, _)| name.as_str() != "NODE_OPTIONS")
+        .filter(|(name, value)| std::env::var(name).ok().as_deref() != Some(value.as_str()))
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    // Node resolves real paths with an lstat of every parent folder, `C:\` included, which the
+    // sandbox denies (EPERM): keep the symbolic paths, on top of the caller's own options.
+    let node_options = env
+        .get("NODE_OPTIONS")
+        .cloned()
+        .or_else(|| std::env::var("NODE_OPTIONS").ok())
+        .filter(|options| !options.trim().is_empty());
+    changed_env.push(match node_options {
+        Some(options) => {
+            format!("NODE_OPTIONS={options} --preserve-symlinks --preserve-symlinks-main")
+        }
+        None => "NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main".to_string(),
+    });
+    let mut process = serde_json::json!({
+        "env": changed_env,
+        "inheritDefaultEnv": true,
+        "timeout": 0,
+    });
+    if let Some(cwd) = cwd {
+        process["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
+    }
+    let policy = serde_json::json!({
+        "version": "1.0.0",
+        "containment": "processcontainer",
+        "process": process,
+        "filesystem": {
+            "readwritePaths": writable_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            "readonlyPaths": readonly_paths,
+            "deniedPaths": [],
+        },
+        "network": {
+            "egress": { "default": "deny" },
+            "ingress": { "default": "deny", "hostLoopback": "deny" },
+        },
+        // Git for Windows needs Win32k to initialize.
+        "ui": { "disable": false },
+    });
+    // Errors are written to stderr as plain text: without this, PowerShell serializes them as
+    // CLIXML when its output is redirected. The exit code is the native command's, else 1 when a
+    // PowerShell error occurred, else 0 (so `git log | Select-Object -First 2` is not a failure).
+    const SCRIPT_TEMPLATE: &str = r#"$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$global:LASTEXITCODE = 0
+$zedEvalFailed = $false
+& {
+__COMMAND__
+} 2>&1 | ForEach-Object {
+  if ($_ -is [System.Management.Automation.ErrorRecord]) {
+    if ($_.FullyQualifiedErrorId -like 'NativeCommandError*') { [Console]::Error.WriteLine($_.ToString()) }
+    else { $zedEvalFailed = $true; [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()) }
+  } else { $_ }
+}
+if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif ($zedEvalFailed) { exit 1 } else { exit 0 }
+"#;
+    let script = SCRIPT_TEMPLATE.replacen("__COMMAND__", command, 1);
+    let script_utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    let engine = base64::engine::general_purpose::STANDARD;
+    if posix_shell {
+        // stdin from /dev/null: nobody answers a prompt in a headless run.
+        return (
+            mxc_exec.to_string(),
+            vec![
+                "--config-base64".to_string(),
+                engine.encode(policy.to_string()),
+                "--".to_string(),
+                shell.to_string(),
+                "-c".to_string(),
+                format!("{{ {command}\n}} </dev/null"),
+            ],
+        );
+    }
+    (
+        mxc_exec.to_string(),
+        vec![
+            "--config-base64".to_string(),
+            engine.encode(policy.to_string()),
+            "--".to_string(),
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-InputFormat".to_string(),
+            "None".to_string(),
+            "-EncodedCommand".to_string(),
+            engine.encode(script_utf16),
+        ],
+    )
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
     use super::*;

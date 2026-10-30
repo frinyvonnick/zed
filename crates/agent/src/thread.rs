@@ -3946,7 +3946,12 @@ impl Thread {
             return None;
         }
 
-        log::debug!("Running tool {}", tool_use.name);
+        // Local patch (eval bench): log the input too, so a tool that never finishes can be named.
+        log::debug!(
+            "Running tool {} input={}",
+            tool_use.name,
+            input.to_string().chars().take(300).collect::<String>()
+        );
         let tool_input = ToolInput::ready(input);
         Some(self.run_tool(
             tool,

@@ -99,6 +99,12 @@ pub fn get_default_system_shell_preferring_bash() -> String {
 
 #[cfg(windows)]
 pub fn get_windows_bash() -> Option<String> {
+    // Local patch (eval bench): MXC. Git Bash cannot start inside a Microsoft ProcessContainer,
+    // so when agent commands run through wxc-exec the shell (and what the model is told) is the
+    // busybox named `sh.exe` given by ZED_EVAL_MXC_SHELL, else PowerShell.
+    if std::env::var_os("ZED_EVAL_MXC_EXEC").is_some() {
+        return std::env::var("ZED_EVAL_MXC_SHELL").ok();
+    }
     fn find_bash_in_installation(install_root: &Path) -> Option<PathBuf> {
         if !install_root.join("git-bash.exe").is_file() {
             return None;

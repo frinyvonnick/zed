@@ -163,6 +163,10 @@ static TERMINATED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let args = Args::parse();
+    // Keep eval runs out of the editor's own database and settings (local patch).
+    if let Ok(data_dir) = std::env::var("ZED_EVAL_DATA_DIR") {
+        paths::set_custom_data_dir(&data_dir);
+    }
 
     if args.printenv {
         util::shell_env::print_env();
@@ -702,12 +706,20 @@ async fn run_agent(
                 )
             }
         };
+        // Local patch (eval bench): MXC. When agent commands run through wxc-exec, Zed's own WSL
+        // sandbox is turned off so commands are not wrapped twice.
+        let sandbox_permissions = if std::env::var_os("ZED_EVAL_MXC_EXEC").is_some() {
+            r#"{"allow_unsandboxed": true, "warn_ntfs_grants": false}"#
+        } else {
+            r#"{"warn_ntfs_grants": false}"#
+        };
         SettingsStore::update_global(cx, |store, cx| {
             let settings = format!(
                 r#"{{
                     "language_models": {language_models_settings},
                     "agent": {{
                         "tool_permissions": {{"default": "allow"}},
+                        "sandbox_permissions": {sandbox_permissions},
                         "default_model": {{
                             "provider": "{provider_id}",
                             "model": "{model_id}",
@@ -717,7 +729,7 @@ async fn run_agent(
                     }},
                     "autosave": "off",
                     "format_on_save": "off"
-                }}"
+                }}
                 "#
             );
             store.set_user_settings(&settings, cx).result()
@@ -764,7 +776,9 @@ async fn run_agent(
     };
 
     let output_worktree = match output_dir {
-        Some(output_dir) if !output_dir.starts_with(workdir) => {
+        // Local patch: ZED_EVAL_HIDE_OUTPUT_DIR keeps the output folder out of the project, so the
+        // agent cannot see the eval name nor other runs' results (blind evals).
+        Some(output_dir) if !output_dir.starts_with(workdir) && std::env::var("ZED_EVAL_HIDE_OUTPUT_DIR").is_err() => {
             let output_worktree = project.update(cx, |project, cx| {
                 project.create_worktree(output_dir, true, cx)
             });
@@ -796,6 +810,25 @@ async fn run_agent(
     let agent = cx.update(|cx| {
         let thread_store = cx.new(|cx| ThreadStore::new(cx));
         NativeAgent::new(thread_store, Templates::new(), app_state.fs.clone(), cx)
+    });
+
+    // Local patch (eval bench): nobody answers a permission prompt in a headless run, so a
+    // sandbox escalation (network, writes outside the project, unsandboxed) waited until the run
+    // timeout. Refuse every permission-grant request at once, in the parent thread and in every
+    // subagent thread, so the tool returns a denial the model can read.
+    let _deny_permission_requests = cx.update(|cx| {
+        cx.observe_new(|_thread: &mut acp_thread::AcpThread, _window, cx| {
+            cx.subscribe_self(
+                |thread: &mut acp_thread::AcpThread, event: &acp_thread::AcpThreadEvent, cx| {
+                    if let acp_thread::AcpThreadEvent::ToolAuthorizationRequested(request_id) =
+                        event
+                    {
+                        deny_permission_request(thread, *request_id, cx);
+                    }
+                },
+            )
+            .detach();
+        })
     });
 
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
@@ -951,6 +984,38 @@ async fn run_agent(
             tool_calls,
         },
     )
+}
+
+/// Local patch (eval bench): refuses one pending permission-grant request and logs what the
+/// agent asked for. Other prompt kinds (choosing an action) are left alone.
+fn deny_permission_request(
+    thread: &mut acp_thread::AcpThread,
+    request_id: acp_thread::PermissionRequestId,
+    cx: &mut gpui::Context<acp_thread::AcpThread>,
+) {
+    let Some(request) = thread.permission_request(request_id) else {
+        return;
+    };
+    if request.legacy_kind() != Some(acp_thread::AuthorizationKind::PermissionGrant) {
+        return;
+    }
+    let asked = request
+        .legacy_tool_call_id()
+        .and_then(|tool_call_id| thread.tool_call(tool_call_id))
+        .and_then(|(_, tool_call)| tool_call.raw_input.as_ref())
+        .map(|input| input.to_string())
+        .unwrap_or_default();
+    let reject = request
+        .legacy_options()
+        .and_then(|options| options.first_option_of_kind(acp_v2::PermissionOptionKind::RejectOnce))
+        .map(|option| {
+            acp_thread::SelectedPermissionOutcome::new(option.option_id.clone(), option.kind.clone())
+        });
+    eprintln!("[eval-cli] permission refusée par le banc : {asked}");
+    match reject {
+        Some(outcome) => thread.authorize_permission_request(request_id, outcome, cx),
+        None => thread.cancel_permission_request(request_id, cx),
+    }
 }
 
 fn log_acp_thread_event(

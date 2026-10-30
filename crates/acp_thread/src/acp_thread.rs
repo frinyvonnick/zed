@@ -8053,6 +8053,30 @@ impl AcpThread {
                             )),
                         };
                         (task_command, task_args, task_env, sandbox, None)
+                    } else if let Ok(mxc_exec) = std::env::var("ZED_EVAL_MXC_EXEC") {
+                        // Local patch (eval bench): MXC. Run the command in the shell (busybox sh
+                        // or PowerShell) inside a Microsoft ProcessContainer (wxc-exec): write only
+                        // in the project's worktrees, read only the listed tools, no network.
+                        let writable_paths = project.update(cx, |project, cx| {
+                            project
+                                .worktrees(cx)
+                                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                                .collect::<Vec<_>>()
+                        });
+                        let mut full_command = command.clone();
+                        for argument in &args {
+                            full_command.push(' ');
+                            full_command.push_str(argument);
+                        }
+                        let (task_command, task_args) = crate::terminal::mxc_wrap_command(
+                            &mxc_exec,
+                            &shell,
+                            &full_command,
+                            cwd.as_deref(),
+                            &writable_paths,
+                            &env,
+                        );
+                        (task_command, task_args, env, None, cwd.clone())
                     } else {
                         // No sandbox wrap means we're running unsandboxed, and
                         // on Windows that deliberately changes the shell: the
