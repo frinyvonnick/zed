@@ -1034,25 +1034,45 @@ pub(crate) fn mxc_wrap_command(
             readonly_paths.push(folder.to_string_lossy().into_owned());
         }
     }
-    let mut changed_env: Vec<String> = env
+    let changed_env: Vec<String> = env
         .iter()
-        .filter(|(name, _)| name.as_str() != "NODE_OPTIONS")
         .filter(|(name, value)| std::env::var(name).ok().as_deref() != Some(value.as_str()))
         .map(|(name, value)| format!("{name}={value}"))
         .collect();
     // Node resolves real paths with an lstat of every parent folder, `C:\` included, which the
-    // sandbox denies (EPERM): keep the symbolic paths, on top of the caller's own options.
-    let node_options = env
-        .get("NODE_OPTIONS")
-        .cloned()
-        .or_else(|| std::env::var("NODE_OPTIONS").ok())
-        .filter(|options| !options.trim().is_empty());
-    changed_env.push(match node_options {
-        Some(options) => {
-            format!("NODE_OPTIONS={options} --preserve-symlinks --preserve-symlinks-main")
-        }
-        None => "NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main".to_string(),
-    });
+    // sandbox denies (EPERM). An enumerate-only grant on the drive roots lets it list folders and
+    // read file attributes, never file content nor writes. The folders in `ZED_EVAL_MXC_DENIED`
+    // (`;`-separated) stay out of reach, names included. By default: the user's `audits`, where
+    // the expected answers live, the real repository and `.claude`, so that an agent of the bench
+    // does not even see them (one already acted on the real repository by an absolute path).
+    let mut enumerate_paths: Vec<String> = writable_paths
+        .iter()
+        .filter_map(|path| path.ancestors().last())
+        .map(|root| root.to_string_lossy().into_owned())
+        .collect();
+    enumerate_paths.sort();
+    enumerate_paths.dedup();
+    let denied_paths: Vec<String> = match std::env::var("ZED_EVAL_MXC_DENIED") {
+        Ok(list) => list
+            .split(';')
+            .filter(|path| !path.trim().is_empty())
+            .map(|path| path.trim().to_string())
+            .collect(),
+        Err(_) => std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .into_iter()
+            .flat_map(|profile| {
+                [
+                    profile.join("audits"),
+                    profile.join("Documents\\Workspace\\snotra-dev"),
+                    profile.join(".claude"),
+                ]
+            })
+            // MXC fails closed on a denied path it cannot resolve.
+            .filter(|path| path.exists())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+    };
     let mut process = serde_json::json!({
         "env": changed_env,
         "inheritDefaultEnv": true,
@@ -1071,8 +1091,9 @@ pub(crate) fn mxc_wrap_command(
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
             "readonlyPaths": readonly_paths,
-            "deniedPaths": [],
+            "deniedPaths": denied_paths,
         },
+        "processContainer": { "filesystem": { "enumeratePaths": enumerate_paths } },
         "network": {
             "egress": { "default": "deny" },
             "ingress": { "default": "deny", "hostLoopback": "deny" },
