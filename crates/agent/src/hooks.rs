@@ -1017,6 +1017,10 @@ fn log_unsupported_fields(output: &serde_json::Value) {
     }
 }
 
+/// The options of the question a `PreToolUse` ask puts to the user.
+const HOOK_ASK_ALLOW: &str = "allow";
+const HOOK_ASK_DENY: &str = "deny";
+
 fn cancelled_output() -> AgentToolOutput {
     anyhow!("Tool call cancelled by user").into()
 }
@@ -1173,6 +1177,7 @@ impl AnyAgentTool for HookedTool {
                 // Hooks run one after the other in declaration order: each one
                 // sees the input as corrected by the previous ones, the first
                 // refusal wins, and the notes for the model accumulate in order.
+                let mut asked: Option<String> = None;
                 for hook in &self.pre_tool_use {
                     let hook_input = self.context.input(
                         "PreToolUse",
@@ -1213,19 +1218,14 @@ impl AnyAgentTool for HookedTool {
                             let reason = reason.unwrap_or("A hook denied this tool call.");
                             return Err(refused_output(reason.to_string(), notes));
                         }
-                        // Until Zed can ask the user from a hook, asking refuses.
+                        // An ask lets the chain go on, so that a later
+                        // refusal still wins; the user answers once it ends.
                         Some("ask") => {
-                            log::info!(
-                                "agent hook asked to confirm a {} call; refused",
-                                self.tool_name
-                            );
-                            notes.extend(context.map(str::to_string));
-                            let mut message = "A hook asked to confirm this tool call, which Zed cannot do yet, so the call was refused."
-                                .to_string();
-                            if let Some(reason) = reason {
-                                message.push_str(&format!(" Reason: {reason}"));
-                            }
-                            return Err(refused_output(message, notes));
+                            asked.get_or_insert_with(|| {
+                                reason
+                                    .unwrap_or("A hook asks to confirm this tool call.")
+                                    .to_string()
+                            });
                         }
                         _ => {}
                     }
@@ -1244,6 +1244,39 @@ impl AnyAgentTool for HookedTool {
                     notes.extend(context.map(str::to_string));
                     if let Some(updated_input) = updated_input {
                         tool_input = updated_input.clone();
+                    }
+                }
+                // A hook asked: the user decides, with the hook's reason.
+                if let Some(reason) = asked {
+                    let prompt = cx.update(|cx| {
+                        event_stream.prompt_for_decision(
+                            None,
+                            Some(reason),
+                            vec![
+                                acp_v2::PermissionOption::new(
+                                    acp_v2::PermissionOptionId::new(HOOK_ASK_ALLOW),
+                                    "Allow",
+                                    acp_v2::PermissionOptionKind::AllowOnce,
+                                ),
+                                acp_v2::PermissionOption::new(
+                                    acp_v2::PermissionOptionId::new(HOOK_ASK_DENY),
+                                    "Deny",
+                                    acp_v2::PermissionOptionKind::RejectOnce,
+                                ),
+                            ],
+                            cx,
+                        )
+                    });
+                    let choice = futures::select_biased! {
+                        _ = event_stream.cancelled_by_user().fuse() => return Err(cancelled_output()),
+                        choice = prompt.fuse() => choice,
+                    };
+                    if !choice.is_ok_and(|choice| choice.0.as_ref() == HOOK_ASK_ALLOW) {
+                        return Err(refused_output(
+                            "The user refused this tool call, which a hook asked to confirm."
+                                .to_string(),
+                            notes,
+                        ));
                     }
                 }
 
@@ -4420,20 +4453,94 @@ pub(crate) mod tests {
         assert_eq!(echo.runs.get(), 1);
     }
 
-    #[gpui::test]
-    async fn test_pre_tool_use_ask_is_refused_until_supported(cx: &mut TestAppContext) {
-        let (ask, _) = fake_hook(Ok(pre_tool_use(json!({
+    /// Runs the tool, which a hook makes ask the user, and answers with the
+    /// option `answer`; returns whether the model sees an error, the text it
+    /// sees, and the message the user was shown.
+    async fn run_echo_confirming(
+        tool: Arc<HookedTool>,
+        answer: &str,
+        cx: &mut TestAppContext,
+    ) -> (bool, Vec<String>, String) {
+        let (event_stream, mut receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            tool.run(
+                ToolInput::ready(json!({ "text": "hello" })),
+                event_stream,
+                cx,
+            )
+        });
+        let authorization = receiver.expect_authorization().await;
+        let message = format!("{:?}", authorization.tool_call.content);
+        let kind = match answer {
+            "allow" => acp_v2::PermissionOptionKind::AllowOnce,
+            _ => acp_v2::PermissionOptionKind::RejectOnce,
+        };
+        authorization
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp_v2::PermissionOptionId::new(answer),
+                kind,
+            ))
+            .ok();
+        let (is_error, output) = match task.await {
+            Ok(output) => (false, output),
+            Err(output) => (true, output),
+        };
+        let texts = output
+            .llm_output
+            .iter()
+            .filter_map(|part| match part {
+                LanguageModelToolResultContent::Text(text) => Some(text.to_string()),
+                LanguageModelToolResultContent::Image(_) => None,
+            })
+            .collect();
+        (is_error, texts, message)
+    }
+
+    fn asking_hook() -> Arc<dyn HookHandler> {
+        fake_hook(Ok(pre_tool_use(json!({
             "permissionDecision": "ask",
             "permissionDecisionReason": "Pushing to main.",
-        }))));
-        let (tool, echo) = hooked_echo(vec![ask], Vec::new());
+        }))))
+        .0
+    }
 
+    #[gpui::test]
+    async fn test_pre_tool_use_ask_runs_the_tool_the_user_allows(cx: &mut TestAppContext) {
+        let (tool, echo) = hooked_echo(vec![asking_hook()], Vec::new());
+
+        let (is_error, texts, message) = run_echo_confirming(tool, "allow", cx).await;
+
+        assert!(message.contains("Pushing to main."), "{message}");
+        assert!(!is_error);
+        assert_eq!(texts, vec!["hello".to_string()]);
+        assert_eq!(echo.runs.get(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_pre_tool_use_ask_refuses_the_tool_the_user_denies(cx: &mut TestAppContext) {
+        let (tool, echo) = hooked_echo(vec![asking_hook()], Vec::new());
+
+        let (is_error, texts, _) = run_echo_confirming(tool, "deny", cx).await;
+
+        assert!(is_error);
+        assert!(texts[0].contains("The user refused"), "{texts:?}");
+        assert_eq!(echo.runs.get(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_pre_tool_use_ask_lets_a_later_denial_win(cx: &mut TestAppContext) {
+        let (deny, _) = fake_hook(Ok(pre_tool_use(json!({
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Never on main.",
+        }))));
+        let (tool, echo) = hooked_echo(vec![asking_hook(), deny], Vec::new());
+
+        // No question: the run would wait for an answer that never comes.
         let (is_error, texts) = run_echo(tool, "hello", cx).await;
 
         assert!(is_error);
-        assert_eq!(texts.len(), 1);
-        assert!(texts[0].contains("confirm"), "{texts:?}");
-        assert!(texts[0].contains("Pushing to main."), "{texts:?}");
+        assert_eq!(texts, vec!["Never on main.".to_string()]);
         assert_eq!(echo.runs.get(), 0);
     }
 
