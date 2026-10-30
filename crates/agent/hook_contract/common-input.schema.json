@@ -103,7 +103,7 @@
         },
         "depth": {
           "type": "integer",
-          "description": "0 for a root conversation, 1 for its subagents, 2 for theirs, and so on.",
+          "description": "0 for a root conversation, 1 for its subagents, 2 for theirs, and so on. For SubagentStart and SubagentStop, depth and thread_id are the parent's; agent_id is the subagent's thread id.",
           "minimum": 0
         },
         "timestamp": {

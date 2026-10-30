@@ -1,6 +1,6 @@
 use crate::{
-    AgentToolOutput, AnyAgentTool, Thread, ToolCallEventStream, ToolInput, ToolInputPayload,
-    ToolInputSender,
+    AgentModelId, AgentToolOutput, AnyAgentTool, SubagentHandle, TerminalHandle, Thread,
+    ThreadEnvironment, ToolCallEventStream, ToolInput, ToolInputPayload, ToolInputSender,
 };
 use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::{AgentSettings, COMPACTION_PROMPT};
@@ -23,10 +23,12 @@ use serde_json::json;
 use settings::Settings as _;
 use sha2::{Digest as _, Sha256};
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     hash::{DefaultHasher, Hash as _, Hasher as _},
     path::{Path, PathBuf},
     process::Stdio,
+    rc::Rc,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
@@ -67,6 +69,8 @@ pub struct AgentHooks {
     pub pre_compact: Vec<HookMatcherGroup>,
     pub post_compact: Vec<HookMatcherGroup>,
     pub zed_model_error: Vec<HookMatcherGroup>,
+    pub subagent_start: Vec<HookMatcherGroup>,
+    pub subagent_stop: Vec<HookMatcherGroup>,
 }
 
 impl Global for AgentHooks {}
@@ -93,6 +97,8 @@ impl AgentHooks {
             pre_compact: matcher_groups_from_settings(&hooks["PreCompact"], data_root),
             post_compact: matcher_groups_from_settings(&hooks["PostCompact"], data_root),
             zed_model_error: matcher_groups_from_settings(&hooks["ZedModelError"], data_root),
+            subagent_start: matcher_groups_from_settings(&hooks["SubagentStart"], data_root),
+            subagent_stop: matcher_groups_from_settings(&hooks["SubagentStop"], data_root),
         })
     }
 }
@@ -190,7 +196,7 @@ fn check_hook_settings(hooks: &serde_json::Value) -> Result<()> {
 }
 
 /// The events this version of Zed runs hooks for.
-const SUPPORTED_EVENTS: [&str; 7] = [
+const SUPPORTED_EVENTS: [&str; 9] = [
     "PreToolUse",
     "PostToolUse",
     "BeforeModel",
@@ -198,6 +204,8 @@ const SUPPORTED_EVENTS: [&str; 7] = [
     "PreCompact",
     "PostCompact",
     "ZedModelError",
+    "SubagentStart",
+    "SubagentStop",
 ];
 
 fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
@@ -1217,7 +1225,7 @@ impl ModelHooks {
                 );
             }
             log_unsupported_output_fields(&output, &UNSUPPORTED_COMPACTION_FIELDS);
-            warn_on_unknown_zed_fields("PreCompact", &output, "additional_instructions");
+            warn_on_unknown_zed_fields("PreCompact", &output, &["additional_instructions"]);
             match hook_text(&output, "/hookSpecificOutput/zed/additional_instructions") {
                 Ok(text) => instructions.extend(text.map(str::to_string)),
                 Err(error) => log::warn!("PreCompact hook output ignored: {error:#}"),
@@ -1623,9 +1631,9 @@ fn hook_text<'a>(output: &'a serde_json::Value, pointer: &str) -> Result<Option<
     }
 }
 
-/// Warns about a `zed` object that does not carry the event's one field: a
-/// misspelt name would otherwise be ignored silently.
-fn warn_on_unknown_zed_fields(event: &str, output: &serde_json::Value, field: &str) {
+/// Warns about a `zed` object that holds none of the event's fields, or
+/// other fields: a misspelt name would otherwise be ignored silently.
+fn warn_on_unknown_zed_fields(event: &str, output: &serde_json::Value, fields: &[&str]) {
     let Some(zed) = output
         .pointer("/hookSpecificOutput/zed")
         .and_then(serde_json::Value::as_object)
@@ -1634,11 +1642,12 @@ fn warn_on_unknown_zed_fields(event: &str, output: &serde_json::Value, field: &s
     };
     let unknown = zed
         .keys()
-        .filter(|key| key.as_str() != field)
+        .filter(|key| !fields.contains(&key.as_str()))
         .collect::<Vec<_>>();
-    if !unknown.is_empty() || !zed.contains_key(field) {
+    if !unknown.is_empty() || !fields.iter().any(|field| zed.contains_key(*field)) {
         log::warn!(
-            "{event} hook output: the `zed` object should hold `{field}`; ignored fields: {unknown:?}"
+            "{event} hook output: the `zed` object should hold {fields:?}; ignored fields: \
+             {unknown:?}"
         );
     }
 }
@@ -1755,7 +1764,7 @@ async fn run_post_compact(
             );
         }
         log_unsupported_output_fields(&output, &UNSUPPORTED_COMPACTION_FIELDS);
-        warn_on_unknown_zed_fields("PostCompact", &output, "append_to_summary");
+        warn_on_unknown_zed_fields("PostCompact", &output, &["append_to_summary"]);
         match hook_text(&output, "/hookSpecificOutput/zed/append_to_summary") {
             Ok(Some(passage)) => {
                 summary = format!("{summary}\n\n{passage}");
@@ -2282,14 +2291,20 @@ fn applies_ephemeral_messages(request: &LanguageModelRequest) -> bool {
     )
 }
 
+/// Neutralises a `<system-reminder>` tag inside a text, so that it cannot
+/// close the reminder it is wrapped in. Stricter than Claude Code: any case,
+/// and spaces inside the tag.
+fn escape_reminder_tags(text: &str) -> std::borrow::Cow<'_, str> {
+    static TAG: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)<(\s*/?\s*system-reminder)").unwrap());
+    TAG.replace_all(text, "&lt;$1")
+}
+
 /// A reminder as Zed sends it: a user message wrapped in `<system-reminder>`.
 /// The role is `user`: vLLM refuses a `system` message after the first one.
 /// Like Claude Code, a `<system-reminder>` tag inside the text is neutralised.
 fn reminder_message(text: &str) -> LanguageModelRequestMessage {
-    // Stricter than Claude Code: any case, and spaces inside the tag.
-    static TAG: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?i)<(\s*/?\s*system-reminder)").unwrap());
-    let text = TAG.replace_all(text, "&lt;$1");
+    let text = escape_reminder_tags(text);
     LanguageModelRequestMessage {
         role: Role::User,
         content: vec![MessageContent::Text(format!(
@@ -2334,6 +2349,334 @@ fn log_unsupported_output_fields(output: &serde_json::Value, pointers: &[&str]) 
             log::info!("agent hook output field `{pointer}` is not supported yet; ignored");
         }
     }
+}
+
+/// Wraps the environment of a thread so that the subagents it creates run
+/// the `SubagentStart` and `SubagentStop` hooks.
+pub(crate) fn wrap_environment(
+    thread: &Thread,
+    environment: Rc<dyn ThreadEnvironment>,
+    cx: &App,
+) -> Rc<dyn ThreadEnvironment> {
+    Rc::new(HookedEnvironment {
+        inner: environment,
+        // The hooks of a subagent fire in its parent: `zed.depth` and
+        // `zed.thread_id` are the parent's; `agent_id` is the subagent's.
+        context: HookContext::for_thread(thread, cx),
+        subagents: Default::default(),
+    })
+}
+
+struct HookedEnvironment {
+    inner: Rc<dyn ThreadEnvironment>,
+    context: HookContext,
+    /// By subagent id, what this environment knows of each subagent.
+    subagents: Rc<RefCell<HashMap<String, SubagentState>>>,
+}
+
+#[derive(Clone)]
+struct SubagentState {
+    label: String,
+}
+
+impl HookedEnvironment {
+    /// Wraps a subagent in the hooks its label matches, if any.
+    fn hooked_subagent(
+        &self,
+        subagent: Rc<dyn SubagentHandle>,
+        label: String,
+        cx: &App,
+    ) -> Rc<dyn SubagentHandle> {
+        let Some((start, stop)) = with_configured_hooks(cx, |hooks| {
+            (
+                matching_hooks(&hooks.subagent_start, &label),
+                matching_hooks(&hooks.subagent_stop, &label),
+            )
+        }) else {
+            return subagent;
+        };
+        if start.is_empty() && stop.is_empty() {
+            return subagent;
+        }
+        Rc::new(HookedSubagent {
+            inner: subagent,
+            label,
+            context: self.context.clone(),
+            start,
+            stop,
+        })
+    }
+}
+
+impl ThreadEnvironment for HookedEnvironment {
+    fn create_terminal(
+        &self,
+        command: String,
+        extra_env: Vec<(String, String)>,
+        cwd: Option<PathBuf>,
+        output_byte_limit: Option<u64>,
+        sandbox_wrap: Option<acp_thread::SandboxWrap>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Rc<dyn TerminalHandle>>> {
+        self.inner
+            .create_terminal(command, extra_env, cwd, output_byte_limit, sandbox_wrap, cx)
+    }
+
+    fn create_subagent(
+        &self,
+        label: String,
+        model: Option<AgentModelId>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        let subagent = self.inner.create_subagent(label.clone(), model, cx)?;
+        self.subagents.borrow_mut().insert(
+            subagent.id().to_string(),
+            SubagentState {
+                label: label.clone(),
+            },
+        );
+        Ok(self.hooked_subagent(subagent, label, cx))
+    }
+
+    fn resume_subagent(
+        &self,
+        session_id: acp_v2::SessionId,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        let subagent = self.inner.resume_subagent(session_id, cx)?;
+        let id = subagent.id().to_string();
+        // After the parent is reopened, this environment never saw the
+        // subagent: its label is the title of its thread.
+        let label = self
+            .subagents
+            .borrow_mut()
+            .entry(id.clone())
+            .or_insert_with(|| SubagentState {
+                label: subagent
+                    .label(cx)
+                    .map(|label| label.to_string())
+                    .unwrap_or_else(|| id.clone()),
+            })
+            .label
+            .clone();
+        Ok(self.hooked_subagent(subagent, label, cx))
+    }
+
+    fn create_sibling_thread(
+        &self,
+        request: crate::SiblingThreadRequest,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<crate::SiblingThreadInfo>> {
+        self.inner.create_sibling_thread(request, cx)
+    }
+
+    fn list_available_agents(&self, cx: &mut App) -> Result<crate::AvailableAgents> {
+        self.inner.list_available_agents(cx)
+    }
+}
+
+/// A subagent whose turns run the `SubagentStart` hooks until it has ever
+/// run, and the `SubagentStop` hooks after each turn. A refused subagent
+/// never got a message: resuming it runs `SubagentStart` again, so that the
+/// refusal holds. Dropping a turn's task,
+/// as stopping the parent does, abandons its hooks and the turns that would
+/// follow.
+struct HookedSubagent {
+    inner: Rc<dyn SubagentHandle>,
+    label: String,
+    context: HookContext,
+    start: Vec<Arc<dyn HookHandler>>,
+    stop: Vec<Arc<dyn HookHandler>>,
+}
+
+impl SubagentHandle for HookedSubagent {
+    fn id(&self) -> acp_v2::SessionId {
+        self.inner.id()
+    }
+
+    fn num_entries(&self, cx: &App) -> usize {
+        self.inner.num_entries(cx)
+    }
+
+    fn label(&self, cx: &App) -> Option<SharedString> {
+        self.inner.label(cx)
+    }
+
+    fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {
+        let inner = self.inner.clone();
+        let agent_id = self.inner.id().to_string();
+        let label = self.label.clone();
+        let context = self.context.clone();
+        let start = self.start.clone();
+        let stop = self.stop.clone();
+        cx.spawn(async move |cx| {
+            let mut message = message;
+            // A subagent with entries already ran, before a reopen or in a
+            // concurrent turn.
+            let started = cx.update(|cx| inner.num_entries(cx)) > 0;
+            if !started && !start.is_empty() {
+                let notes = run_subagent_start(&start, &context, &agent_id, &label, cx).await?;
+                for note in notes {
+                    message.push_str(&format!(
+                        "\n\n<system-reminder>\n{}\n</system-reminder>",
+                        escape_reminder_tags(&note)
+                    ));
+                }
+            }
+            // A stop hook can continue the subagent with its reason, as many
+            // times as it asks; `stop_hook_active` tells it it already did.
+            let mut stop_hook_active = false;
+            let mut first_answer = None;
+            loop {
+                let output = match inner.send(message, cx).await {
+                    Ok(output) => output,
+                    // A continuation failed: the parent still gets the answer the
+                    // subagent gave first.
+                    Err(error) => {
+                        return Err(match first_answer {
+                            Some(first_answer) => anyhow!(
+                                "{error:#}\n\nThe subagent answered before a SubagentStop \
+                                 hook asked it to continue:\n\n{first_answer}"
+                            ),
+                            None => error,
+                        });
+                    }
+                };
+                first_answer.get_or_insert_with(|| output.clone());
+                let continuation = run_subagent_stop(
+                    &stop,
+                    &context,
+                    &agent_id,
+                    &label,
+                    &output,
+                    stop_hook_active,
+                    cx,
+                )
+                .await;
+                let Some(continuation) = continuation else {
+                    return Ok(output);
+                };
+                message = continuation;
+                stop_hook_active = true;
+            }
+        })
+    }
+}
+
+/// Runs the `SubagentStart` hooks in declaration order. Returns the texts to
+/// add to the subagent's first message, or the first refusal as an error:
+/// the parent model gets it as the `spawn_agent` result.
+async fn run_subagent_start(
+    hooks: &[Arc<dyn HookHandler>],
+    context: &HookContext,
+    agent_id: &str,
+    label: &str,
+    cx: &AsyncApp,
+) -> Result<Vec<String>> {
+    let mut notes = Vec::new();
+    for hook in hooks {
+        let input = context.input(
+            "SubagentStart",
+            json!({ "agent_id": agent_id, "agent_type": label }),
+        );
+        let output = match cx.update(|cx| hook.call(input, cx)).await {
+            Ok(output) => output,
+            Err(error) => {
+                log::warn!("SubagentStart hook failed, continuing: {error:#}");
+                continue;
+            }
+        };
+        if let Err(error) = check_event_name("SubagentStart", &output) {
+            log::warn!("SubagentStart hook output ignored: {error:#}");
+            continue;
+        }
+        // A code 2 arrives as a refusal: Claude Code shows its stderr to the
+        // user only.
+        if output.get("decision").is_some_and(|value| !value.is_null()) {
+            log::warn!(
+                "a SubagentStart hook has no decision to make; ignored (reason: {})",
+                output["reason"].as_str().unwrap_or("none given")
+            );
+        }
+        warn_on_unknown_zed_fields("SubagentStart", &output, &["deny_reason", "model"]);
+        log_unsupported_output_fields(
+            &output,
+            &[
+                "/continue",
+                "/systemMessage",
+                "/stopReason",
+                // The model is chosen when Zed creates the subagent, before
+                // the hooks run.
+                "/hookSpecificOutput/zed/model",
+            ],
+        );
+        let fields = hook_text(&output, "/hookSpecificOutput/zed/deny_reason").and_then(|deny| {
+            Ok((
+                deny,
+                hook_text(&output, "/hookSpecificOutput/additionalContext")?,
+            ))
+        });
+        match fields {
+            Ok((Some(reason), _)) => return Err(anyhow!(reason.to_string())),
+            Ok((None, note)) => notes.extend(note.map(str::to_string)),
+            Err(error) => {
+                log::warn!("SubagentStart hook output ignored, the subagent runs: {error:#}")
+            }
+        }
+    }
+    Ok(notes)
+}
+
+/// Runs the `SubagentStop` hooks in declaration order once a subagent turn
+/// ended. Returns the reason of the first one that continues the turn.
+async fn run_subagent_stop(
+    hooks: &[Arc<dyn HookHandler>],
+    context: &HookContext,
+    agent_id: &str,
+    label: &str,
+    last_assistant_message: &str,
+    stop_hook_active: bool,
+    cx: &AsyncApp,
+) -> Option<String> {
+    for hook in hooks {
+        let input = context.input(
+            "SubagentStop",
+            json!({
+                "stop_hook_active": stop_hook_active,
+                "agent_id": agent_id,
+                "agent_type": label,
+                "agent_transcript_path": null,
+                "last_assistant_message": last_assistant_message,
+            }),
+        );
+        let output = match cx.update(|cx| hook.call(input, cx)).await {
+            Ok(output) => output,
+            Err(error) => {
+                log::warn!("SubagentStop hook failed, continuing: {error:#}");
+                continue;
+            }
+        };
+        if let Err(error) = check_event_name("SubagentStop", &output) {
+            log::warn!("SubagentStop hook output ignored: {error:#}");
+            continue;
+        }
+        log_unsupported_output_fields(
+            &output,
+            &[
+                "/continue",
+                "/systemMessage",
+                "/stopReason",
+                "/hookSpecificOutput/additionalContext",
+            ],
+        );
+        if output["decision"] == "block" {
+            match hook_text(&output, "/reason") {
+                Ok(Some(reason)) => return Some(reason.to_string()),
+                _ => log::warn!("a SubagentStop hook continued the turn without a reason; ignored"),
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2718,7 +3061,23 @@ pub(crate) mod tests {
         assert!(created);
     }
 
-    const CONTRACT_SCHEMAS: [(&str, &str); 18] = [
+    const CONTRACT_SCHEMAS: [(&str, &str); 22] = [
+        (
+            "SubagentStart.input.schema.json",
+            include_str!("../hook_contract/SubagentStart.input.schema.json"),
+        ),
+        (
+            "SubagentStart.output.schema.json",
+            include_str!("../hook_contract/SubagentStart.output.schema.json"),
+        ),
+        (
+            "SubagentStop.input.schema.json",
+            include_str!("../hook_contract/SubagentStop.input.schema.json"),
+        ),
+        (
+            "SubagentStop.output.schema.json",
+            include_str!("../hook_contract/SubagentStop.output.schema.json"),
+        ),
         (
             "ZedModelError.input.schema.json",
             include_str!("../hook_contract/ZedModelError.input.schema.json"),
@@ -4266,5 +4625,448 @@ pub(crate) mod tests {
             Some(ProviderErrorCategory::InvalidRequest)
         );
         assert!(abandoned.load(Ordering::SeqCst));
+    }
+
+    /// A hook that answers with the next of its responses, then `{}`, and
+    /// records its inputs.
+    struct SequenceHook {
+        responses: RefCell<std::collections::VecDeque<serde_json::Value>>,
+        calls: Rc<RefCell<Vec<serde_json::Value>>>,
+    }
+
+    impl HookHandler for SequenceHook {
+        fn call(&self, input: serde_json::Value, _cx: &mut App) -> Task<Result<serde_json::Value>> {
+            self.calls.borrow_mut().push(input);
+            let response = self.responses.borrow_mut().pop_front();
+            Task::ready(Ok(response.unwrap_or_else(|| json!({}))))
+        }
+    }
+
+    /// A subagent that records the messages it gets and answers with its
+    /// outputs, in order, then "done".
+    struct RecordingSubagent {
+        outputs: RefCell<std::collections::VecDeque<String>>,
+        messages: Rc<RefCell<Vec<String>>>,
+        /// Entries from turns before the test.
+        entries: std::cell::Cell<usize>,
+    }
+
+    impl SubagentHandle for RecordingSubagent {
+        fn id(&self) -> acp_v2::SessionId {
+            acp_v2::SessionId::new("subagent-1")
+        }
+
+        fn num_entries(&self, _cx: &App) -> usize {
+            self.entries.get() + self.messages.borrow().len()
+        }
+
+        fn label(&self, _cx: &App) -> Option<SharedString> {
+            Some("explorer".into())
+        }
+
+        fn send(&self, message: String, _cx: &AsyncApp) -> Task<Result<String>> {
+            self.messages.borrow_mut().push(message);
+            let output = self.outputs.borrow_mut().pop_front();
+            let output = output.unwrap_or_else(|| "done".to_string());
+            Task::ready(match output.strip_prefix("!error:") {
+                Some(error) => Err(anyhow!(error.to_string())),
+                None => Ok(output),
+            })
+        }
+    }
+
+    struct SubagentEnvironment {
+        subagent: Rc<RecordingSubagent>,
+    }
+
+    impl ThreadEnvironment for SubagentEnvironment {
+        fn create_terminal(
+            &self,
+            _command: String,
+            _extra_env: Vec<(String, String)>,
+            _cwd: Option<PathBuf>,
+            _output_byte_limit: Option<u64>,
+            _sandbox_wrap: Option<acp_thread::SandboxWrap>,
+            _cx: &mut AsyncApp,
+        ) -> Task<Result<Rc<dyn TerminalHandle>>> {
+            unimplemented!()
+        }
+
+        fn create_subagent(
+            &self,
+            _label: String,
+            _model: Option<AgentModelId>,
+            _cx: &mut App,
+        ) -> Result<Rc<dyn SubagentHandle>> {
+            Ok(self.subagent.clone())
+        }
+
+        fn resume_subagent(
+            &self,
+            _session_id: acp_v2::SessionId,
+            _cx: &mut App,
+        ) -> Result<Rc<dyn SubagentHandle>> {
+            Ok(self.subagent.clone())
+        }
+    }
+
+    fn hooked_environment(outputs: &[&str]) -> (HookedEnvironment, Rc<RefCell<Vec<String>>>) {
+        hooked_environment_with_entries(outputs, 0)
+    }
+
+    /// A hooked environment whose subagent answers with `outputs`, after
+    /// `entries` from earlier turns; returns it with the messages the
+    /// subagent received.
+    fn hooked_environment_with_entries(
+        outputs: &[&str],
+        entries: usize,
+    ) -> (HookedEnvironment, Rc<RefCell<Vec<String>>>) {
+        let messages = Rc::new(RefCell::new(Vec::new()));
+        let subagent = Rc::new(RecordingSubagent {
+            outputs: RefCell::new(outputs.iter().map(|output| output.to_string()).collect()),
+            messages: messages.clone(),
+            entries: std::cell::Cell::new(entries),
+        });
+        let environment = HookedEnvironment {
+            inner: Rc::new(SubagentEnvironment { subagent }),
+            context: error_hooks(Vec::new()).context,
+            subagents: Default::default(),
+        };
+        (environment, messages)
+    }
+
+    fn subagent_hooks(
+        start: Vec<(Option<&str>, Arc<dyn HookHandler>)>,
+        stop: Vec<Arc<dyn HookHandler>>,
+    ) -> AgentHooks {
+        let groups = |hooks: Vec<(Option<&str>, Arc<dyn HookHandler>)>| {
+            hooks
+                .into_iter()
+                .map(|(matcher, hook)| HookMatcherGroup {
+                    matcher: matcher.map(str::to_string),
+                    hooks: vec![hook],
+                })
+                .collect()
+        };
+        AgentHooks {
+            subagent_start: groups(start),
+            subagent_stop: groups(stop.into_iter().map(|hook| (None, hook)).collect()),
+            ..Default::default()
+        }
+    }
+
+    async fn spawn(
+        environment: &HookedEnvironment,
+        label: &str,
+        message: &str,
+        cx: &mut TestAppContext,
+    ) -> Result<String> {
+        let subagent = cx
+            .update(|cx| environment.create_subagent(label.to_string(), None, cx))
+            .unwrap();
+        let task = cx.update(|cx| subagent.send(message.to_string(), &cx.to_async()));
+        task.await
+    }
+
+    #[gpui::test]
+    async fn test_subagent_start_gets_the_subagent_id_and_adds_context(cx: &mut TestAppContext) {
+        let (start, start_calls) = fake_hook(Ok(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "additionalContext": "Read only: do not edit files.",
+            }
+        })));
+        cx.update(|cx| cx.set_global(subagent_hooks(vec![(None, start)], Vec::new())));
+        let (environment, messages) = hooked_environment(&["found it"]);
+
+        let output = spawn(&environment, "explorer", "Find the config", cx).await;
+
+        assert_eq!(output.unwrap(), "found it");
+        let calls = start_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["agent_id"], "subagent-1");
+        assert_eq!(calls[0]["agent_type"], "explorer");
+        assert_matches_contract("SubagentStart.input.schema.json", &calls[0]);
+        assert_eq!(
+            *messages.borrow(),
+            vec![
+                "Find the config\n\n<system-reminder>\nRead only: do not edit files.\n</system-reminder>"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagent_start_can_refuse_the_subagent(cx: &mut TestAppContext) {
+        let (deny, _) = fake_hook(Ok(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "zed": { "deny_reason": "Use the planner profile instead." },
+            }
+        })));
+        cx.update(|cx| cx.set_global(subagent_hooks(vec![(None, deny)], Vec::new())));
+        let (environment, messages) = hooked_environment(&[]);
+
+        let output = spawn(&environment, "explorer", "Find the config", cx).await;
+
+        let error = output.expect_err("the subagent is refused").to_string();
+        assert!(
+            error.contains("Use the planner profile instead."),
+            "{error}"
+        );
+        assert!(messages.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_subagent_stop_can_continue_the_subagent(cx: &mut TestAppContext) {
+        let stop_calls = Rc::new(RefCell::new(Vec::new()));
+        let stop: Arc<dyn HookHandler> = Arc::new(SequenceHook {
+            responses: RefCell::new(
+                vec![json!({ "decision": "block", "reason": "Run the tests first." })].into(),
+            ),
+            calls: stop_calls.clone(),
+        });
+        cx.update(|cx| cx.set_global(subagent_hooks(Vec::new(), vec![stop])));
+        let (environment, messages) = hooked_environment(&["first answer", "second answer"]);
+
+        let output = spawn(&environment, "explorer", "Find the config", cx).await;
+
+        assert_eq!(output.unwrap(), "second answer");
+        assert_eq!(
+            *messages.borrow(),
+            vec![
+                "Find the config".to_string(),
+                "Run the tests first.".to_string()
+            ]
+        );
+        let calls = stop_calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["stop_hook_active"], false);
+        assert_eq!(calls[0]["last_assistant_message"], "first answer");
+        assert_eq!(calls[1]["stop_hook_active"], true);
+        assert_eq!(calls[1]["last_assistant_message"], "second answer");
+        assert_matches_contract("SubagentStop.input.schema.json", &calls[0]);
+    }
+
+    #[gpui::test]
+    async fn test_subagent_hooks_match_the_label(cx: &mut TestAppContext) {
+        let (start, start_calls) = fake_hook(Ok(json!({})));
+        cx.update(|cx| cx.set_global(subagent_hooks(vec![(Some("explorer"), start)], Vec::new())));
+        let (environment, _) = hooked_environment(&[]);
+
+        spawn(&environment, "planner", "Plan it", cx).await.unwrap();
+
+        assert!(start_calls.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_a_resumed_subagent_runs_only_its_stop_hooks(cx: &mut TestAppContext) {
+        let (start, start_calls) = fake_hook(Ok(json!({})));
+        let (stop, stop_calls) = fake_hook(Ok(json!({})));
+        cx.update(|cx| cx.set_global(subagent_hooks(vec![(None, start)], vec![stop])));
+        let (environment, _) = hooked_environment(&[]);
+        spawn(&environment, "explorer", "Find the config", cx)
+            .await
+            .unwrap();
+
+        let resumed = cx
+            .update(|cx| environment.resume_subagent(acp_v2::SessionId::new("subagent-1"), cx))
+            .unwrap();
+        let task = cx.update(|cx| resumed.send("And the tests?".to_string(), &cx.to_async()));
+        task.await.unwrap();
+
+        assert_eq!(start_calls.borrow().len(), 1);
+        let stop_calls = stop_calls.borrow();
+        assert_eq!(stop_calls.len(), 2);
+        assert_eq!(stop_calls[1]["agent_type"], "explorer");
+    }
+
+    /// Answers like `hook`, after `delay`.
+    struct DelayedHook {
+        hook: Arc<dyn HookHandler>,
+        delay: Duration,
+    }
+
+    impl HookHandler for DelayedHook {
+        fn call(&self, input: serde_json::Value, cx: &mut App) -> Task<Result<serde_json::Value>> {
+            let answer = self.hook.call(input, cx);
+            let timer = cx.background_executor().timer(self.delay);
+            cx.background_executor().spawn(async move {
+                timer.await;
+                answer.await
+            })
+        }
+    }
+
+    fn spawn_with_cancellation(
+        environment: HookedEnvironment,
+        cx: &mut TestAppContext,
+    ) -> (
+        Task<Result<crate::SpawnAgentToolOutput, crate::SpawnAgentToolOutput>>,
+        watch::Sender<bool>,
+    ) {
+        use crate::AgentTool as _;
+        let tool = Arc::new(crate::SpawnAgentTool::new(Rc::new(environment)));
+        let (event_stream, _receiver, cancellation_tx) =
+            ToolCallEventStream::test_with_cancellation();
+        let task = cx.update(|cx| {
+            tool.run(
+                ToolInput::resolved(crate::SpawnAgentToolInput {
+                    label: "explorer".to_string(),
+                    message: "Find the config".to_string(),
+                    session_id: None,
+                    model: None,
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        (task, cancellation_tx)
+    }
+
+    #[gpui::test]
+    async fn test_cancelling_during_subagent_start_never_runs_the_subagent(
+        cx: &mut TestAppContext,
+    ) {
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let pending: Arc<dyn HookHandler> = Arc::new(PendingHook {
+            abandoned: abandoned.clone(),
+        });
+        cx.update(|cx| cx.set_global(subagent_hooks(vec![(None, pending)], Vec::new())));
+        let (environment, messages) = hooked_environment(&[]);
+        let (mut task, mut cancellation_tx) = spawn_with_cancellation(environment, cx);
+        cx.run_until_parked();
+
+        cancellation_tx.send(true).ok();
+        cx.run_until_parked();
+
+        assert!(
+            futures::FutureExt::now_or_never(&mut task).is_some(),
+            "cancelling must end spawn_agent"
+        );
+        assert!(abandoned.load(Ordering::SeqCst));
+        assert!(messages.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_cancelling_during_subagent_stop_never_continues_the_subagent(
+        cx: &mut TestAppContext,
+    ) {
+        let (block, _) = fake_hook(Ok(json!({ "decision": "block", "reason": "Keep going." })));
+        let slow_block: Arc<dyn HookHandler> = Arc::new(DelayedHook {
+            hook: block,
+            delay: Duration::from_secs(1),
+        });
+        cx.update(|cx| cx.set_global(subagent_hooks(Vec::new(), vec![slow_block])));
+        let (environment, messages) = hooked_environment(&["first answer"]);
+        let (mut task, mut cancellation_tx) = spawn_with_cancellation(environment, cx);
+        cx.run_until_parked();
+        assert_eq!(messages.borrow().len(), 1);
+
+        cancellation_tx.send(true).ok();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+
+        assert!(futures::FutureExt::now_or_never(&mut task).is_some());
+        assert_eq!(*messages.borrow(), vec!["Find the config".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn test_resuming_a_refused_subagent_runs_subagent_start_again(cx: &mut TestAppContext) {
+        let start_calls = Rc::new(RefCell::new(Vec::new()));
+        let deny = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "zed": { "deny_reason": "Not this one." },
+            }
+        });
+        let deny_twice: Arc<dyn HookHandler> = Arc::new(SequenceHook {
+            responses: RefCell::new(vec![deny.clone(), deny].into()),
+            calls: start_calls.clone(),
+        });
+        cx.update(|cx| cx.set_global(subagent_hooks(vec![(None, deny_twice)], Vec::new())));
+        let (environment, messages) = hooked_environment(&[]);
+        assert!(
+            spawn(&environment, "explorer", "Find the config", cx)
+                .await
+                .is_err()
+        );
+
+        let resumed = cx
+            .update(|cx| environment.resume_subagent(acp_v2::SessionId::new("subagent-1"), cx))
+            .unwrap();
+        let task = cx.update(|cx| resumed.send("Try again".to_string(), &cx.to_async()));
+
+        assert!(task.await.is_err(), "the refusal must hold on a resume");
+        assert_eq!(start_calls.borrow().len(), 2);
+        assert!(messages.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_a_resumed_subagent_keeps_its_label_after_a_reopen(cx: &mut TestAppContext) {
+        let (stop, stop_calls) = fake_hook(Ok(json!({})));
+        cx.update(|cx| {
+            cx.set_global(AgentHooks {
+                subagent_stop: vec![HookMatcherGroup {
+                    matcher: Some("explorer".into()),
+                    hooks: vec![stop],
+                }],
+                ..Default::default()
+            })
+        });
+        // A fresh environment, as after reopening the parent thread: it never
+        // saw the subagent being created.
+        let (environment, _) = hooked_environment(&[]);
+
+        let resumed = cx
+            .update(|cx| environment.resume_subagent(acp_v2::SessionId::new("subagent-1"), cx))
+            .unwrap();
+        let task = cx.update(|cx| resumed.send("And the tests?".to_string(), &cx.to_async()));
+        task.await.unwrap();
+
+        let stop_calls = stop_calls.borrow();
+        assert_eq!(stop_calls.len(), 1);
+        assert_eq!(stop_calls[0]["agent_type"], "explorer");
+    }
+
+    #[gpui::test]
+    async fn test_a_subagent_that_already_ran_is_not_started_again_after_a_reopen(
+        cx: &mut TestAppContext,
+    ) {
+        let (start, start_calls) = fake_hook(Ok(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "additionalContext": "Read only.",
+            }
+        })));
+        cx.update(|cx| cx.set_global(subagent_hooks(vec![(None, start)], Vec::new())));
+        // A fresh environment, as after reopening the parent, for a subagent
+        // that already ran two turns.
+        let (environment, messages) = hooked_environment_with_entries(&[], 2);
+
+        let resumed = cx
+            .update(|cx| environment.resume_subagent(acp_v2::SessionId::new("subagent-1"), cx))
+            .unwrap();
+        let task = cx.update(|cx| resumed.send("And the tests?".to_string(), &cx.to_async()));
+        task.await.unwrap();
+
+        assert!(start_calls.borrow().is_empty());
+        assert_eq!(*messages.borrow(), vec!["And the tests?".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn test_a_failed_continuation_keeps_the_first_answer(cx: &mut TestAppContext) {
+        let (block, _) = fake_hook(Ok(json!({ "decision": "block", "reason": "Check again." })));
+        cx.update(|cx| cx.set_global(subagent_hooks(Vec::new(), vec![block])));
+        let (environment, _) = hooked_environment(&["first answer", "!error:model overloaded"]);
+
+        let error = spawn(&environment, "explorer", "Find the config", cx)
+            .await
+            .expect_err("the continuation failed")
+            .to_string();
+
+        assert!(error.contains("model overloaded"), "{error}");
+        assert!(error.contains("first answer"), "{error}");
     }
 }

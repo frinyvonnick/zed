@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/SubagentStop.input.schema.json",
+  "title": "SubagentStop input",
+  "description": "Fires when a subagent turn ends normally.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "stop_hook_active",
+    "agent_id",
+    "agent_type",
+    "agent_transcript_path",
+    "last_assistant_message"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "SubagentStop"
+    },
+    "stop_hook_active": {
+      "type": "boolean",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2595)."
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2595). Thread id of the subagent.",
+      "minLength": 1
+    },
+    "agent_type": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2595). The spawn_agent `label`.",
+      "minLength": 1
+    },
+    "agent_transcript_path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2595). Always null in Zed (no transcript file)."
+    },
+    "last_assistant_message": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2595). Text of the final subagent message."
+    }
+  },
+  "unevaluatedProperties": false
+}

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/SubagentStart.output.schema.json",
+  "title": "SubagentStart output",
+  "description": "Claude Code cannot block here; the Zed extension can refuse the creation or impose a model. Top level open for Claude Code compatibility (same reason as hookSpecificOutput): unknown fields are ignored.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-output.schema.json"
+    }
+  ],
+  "required": [],
+  "properties": {
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "Event-specific output. Open for Claude Code compatibility: Claude Code adds fields here across versions, and a script shared with Claude Code must not be rejected by Zed for a field Zed does not know. Unknown fields are ignored.",
+      "additionalProperties": true,
+      "required": [
+        "hookEventName"
+      ],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1064). Must be this event name; in Zed a mismatch is a hook failure.",
+          "const": "SubagentStart"
+        },
+        "additionalContext": {
+          "type": "string",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1305). Text added to the model context."
+        },
+        "zed": {
+          "type": "object",
+          "description": "Zed extension. Creation control.",
+          "additionalProperties": false,
+          "required": [],
+          "properties": {
+            "deny_reason": {
+              "type": "string",
+              "description": "If set, the subagent never runs and this text is returned to the parent model as the spawn_agent error. Prototype 0.1: the subagent thread already exists, empty; resuming it runs SubagentStart again.",
+              "minLength": 1
+            },
+            "model": {
+              "type": "string",
+              "description": "Model id imposed on the subagent. Not applied in prototype 0.1: Zed picks the model at creation, before this hook; use PreToolUse on spawn_agent instead.",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

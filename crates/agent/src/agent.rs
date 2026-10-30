@@ -3955,6 +3955,10 @@ impl SubagentHandle for NativeSubagentHandle {
         self.session_id.clone()
     }
 
+    fn label(&self, cx: &App) -> Option<SharedString> {
+        self.subagent_thread.read(cx).title()
+    }
+
     fn num_entries(&self, cx: &App) -> usize {
         self.acp_thread.read(cx).entries().len()
     }
@@ -3965,7 +3969,7 @@ impl SubagentHandle for NativeSubagentHandle {
         let subagent_session_id = self.session_id.clone();
         let parent_thread = self.parent_thread.clone();
 
-        cx.spawn(async move |cx| {
+        let run = cx.spawn(async move |cx| {
             let (task, token_limit_rx, _subscription) = cx.update(|cx| {
                 parent_thread
                     .update(cx, |parent_thread, _cx| {
@@ -4027,7 +4031,7 @@ impl SubagentHandle for NativeSubagentHandle {
             let response_stop_reason = response.as_ref().ok().cloned();
             let result = match response {
                 Ok(reason) => match reason {
-                    acp_v2::StopReason::Cancelled => Err(anyhow!("User canceled")),
+                    acp_v2::StopReason::Cancelled => Err(anyhow!(USER_CANCELED_OUTPUT)),
                     acp_v2::StopReason::MaxTokens => Err(anyhow!("The agent reached the maximum number of tokens.")),
                     acp_v2::StopReason::MaxTurnRequests => Err(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
                     acp_v2::StopReason::Refusal => Err(anyhow!("The agent refused to process that prompt. Try again.")),
@@ -4124,6 +4128,18 @@ impl SubagentHandle for NativeSubagentHandle {
             .log_err();
 
             result
+        });
+        // The caller may stop waiting, as `spawn_agent` does when the parent is
+        // stopped; the turn still runs to its end and records its outcome.
+        let (result_tx, result_rx) = oneshot::channel();
+        cx.background_spawn(async move {
+            result_tx.send(run.await).ok();
+        })
+        .detach();
+        cx.background_spawn(async move {
+            result_rx
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("the subagent turn was dropped")))
         })
     }
 }

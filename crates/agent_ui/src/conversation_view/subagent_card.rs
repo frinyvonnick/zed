@@ -9,7 +9,7 @@ use std::{fmt, ops::Range};
 use super::thread_view::subagent_label;
 
 /// Native subagent tool calls report a user cancellation as output with this text.
-const USER_CANCELED_OUTPUT: &str = "User canceled";
+use agent::USER_CANCELED_OUTPUT;
 
 /// The transcript entry a subagent card stands for. It keys the card's expansion state
 /// and element IDs, since the same subagent can have more than one card.

@@ -786,6 +786,10 @@ pub trait SubagentHandle {
     fn num_entries(&self, cx: &App) -> usize;
     /// Runs a turn for a given message and returns both the response and the index of that output message.
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
+    /// The label the subagent was created with, when known.
+    fn label(&self, _cx: &App) -> Option<SharedString> {
+        None
+    }
 }
 
 pub trait ThreadEnvironment {
@@ -2234,6 +2238,7 @@ impl Thread {
         environment: Rc<dyn ThreadEnvironment>,
         cx: &mut Context<Self>,
     ) {
+        let environment = crate::hooks::wrap_environment(self, environment, cx);
         // Only update the agent location for the root thread, not for subagents.
         let update_agent_location = self.parent_thread_id().is_none();
 

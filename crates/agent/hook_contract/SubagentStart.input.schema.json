@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/SubagentStart.input.schema.json",
+  "title": "SubagentStart input",
+  "description": "Fires when a subagent is created (ThreadEnvironment.create_subagent wrapper), before its first request.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "agent_id",
+    "agent_type"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "SubagentStart"
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2559). Thread id of the new subagent.",
+      "minLength": 1
+    },
+    "agent_type": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:2559). The spawn_agent `label` (Zed has no agent types).",
+      "minLength": 1
+    }
+  },
+  "unevaluatedProperties": false
+}

@@ -2818,6 +2818,184 @@ async fn test_after_model_usage_makes_the_next_turn_compact(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+async fn test_spawn_agent_runs_subagent_start_with_the_subagent_id(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (start, start_calls) = recording_hook(json!({}));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            subagent_start: hook_groups(vec![(None, start)]),
+            ..Default::default()
+        });
+        let mut settings = AgentSettings::get_global(cx).clone();
+        for profile in settings.profiles.values_mut() {
+            profile
+                .tools
+                .insert(SpawnAgentTool::NAME.to_string().into(), true);
+        }
+        AgentSettings::override_global(settings, cx);
+    });
+    let environment = Rc::new(
+        FakeThreadEnvironment::default().with_subagent(FakeSubagentHandle {
+            session_id: acp_v2::SessionId::new("subagent-1"),
+            send_task: Task::ready("done".to_string()).shared(),
+        }),
+    );
+    thread.update(cx, |thread, cx| thread.add_default_tools(environment, cx));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Delegate the search"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "tool_1".into(),
+            name: SpawnAgentTool::NAME.into(),
+            raw_input: json!({ "label": "explorer", "message": "Find the config" }).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(
+                json!({ "label": "explorer", "message": "Find the config" }),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let calls = start_calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "SubagentStart must run for the spawned subagent"
+    );
+    assert_eq!(calls[0]["agent_id"], "subagent-1");
+    assert_eq!(calls[0]["agent_type"], "explorer");
+}
+
+#[gpui::test]
+async fn test_native_subagent_start_gets_the_id_of_the_subagent_requests(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let (start, start_calls) = recording_hook(json!({}));
+    let (before, before_calls) = recording_hook(json!({}));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            subagent_start: hook_groups(vec![(None, start)]),
+            before_model: hook_groups(vec![(None, before)]),
+            ..Default::default()
+        })
+    });
+    let native = Rc::new(NativeThreadEnvironment {
+        agent: test._agent.downgrade(),
+        thread: test.parent.downgrade(),
+        acp_thread: test._acp_thread.downgrade(),
+    });
+    let hooked = cx.update(|cx| crate::hooks::wrap_environment(test.parent.read(cx), native, cx));
+
+    let subagent = cx
+        .update(|cx| hooked.create_subagent("explorer".to_string(), None, cx))
+        .unwrap();
+    assert_eq!(
+        cx.update(|cx| subagent.label(cx)).as_deref(),
+        Some("explorer")
+    );
+    let send = cx.update(|cx| subagent.send("Find the config".to_string(), &cx.to_async()));
+    cx.run_until_parked();
+
+    let request = test.fake.pending_completions().pop().unwrap();
+    let subagent_id = subagent.id().to_string();
+    assert_eq!(request.thread_id.as_deref(), Some(subagent_id.as_str()));
+    assert_eq!(start_calls.lock().unwrap()[0]["agent_id"], subagent_id);
+    assert_eq!(
+        before_calls.lock().unwrap().last().unwrap()["zed"]["thread_id"],
+        subagent_id
+    );
+
+    test.fake.send_last_text(&test.model, "Found it.");
+    test.fake.end_last(&test.model);
+    cx.run_until_parked();
+    assert_eq!(send.await.unwrap(), "Found it.");
+}
+
+fn last_subagent_stop_reason(
+    agent: &Entity<NativeAgent>,
+    session_id: &acp_v2::SessionId,
+    cx: &mut TestAppContext,
+) -> Option<acp_v2::StopReason> {
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(session_id).unwrap().thread.clone()
+    });
+    thread.read_with(cx, |thread, _| {
+        thread
+            .subagent_outcomes()
+            .last()
+            .map(|outcome| outcome.stop_reason.clone())
+    })
+}
+
+#[gpui::test]
+async fn test_a_dropped_native_subagent_turn_still_records_its_cancellation(
+    cx: &mut TestAppContext,
+) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = cx.update(|cx| {
+        test.handle
+            .send("Find the config".to_string(), &cx.to_async())
+    });
+    cx.run_until_parked();
+
+    // What `spawn_agent` does when the parent is stopped: it stops waiting.
+    drop(send);
+    let _cancel = test.parent.update(cx, |parent, cx| parent.cancel(cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        last_subagent_stop_reason(&test._agent, &test.handle.id(), cx),
+        Some(acp_v2::StopReason::Cancelled)
+    );
+}
+
+#[gpui::test]
+async fn test_a_dropped_hooked_subagent_turn_still_records_its_cancellation(
+    cx: &mut TestAppContext,
+) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let (stop, _) = recording_hook(json!({}));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            subagent_stop: hook_groups(vec![(None, stop)]),
+            ..Default::default()
+        })
+    });
+    let native = Rc::new(NativeThreadEnvironment {
+        agent: test._agent.downgrade(),
+        thread: test.parent.downgrade(),
+        acp_thread: test._acp_thread.downgrade(),
+    });
+    let hooked = cx.update(|cx| crate::hooks::wrap_environment(test.parent.read(cx), native, cx));
+    let subagent = cx
+        .update(|cx| hooked.create_subagent("explorer".to_string(), None, cx))
+        .unwrap();
+    let send = cx.update(|cx| subagent.send("Find the config".to_string(), &cx.to_async()));
+    cx.run_until_parked();
+
+    drop(send);
+    let _cancel = test.parent.update(cx, |parent, cx| parent.cancel(cx));
+    cx.run_until_parked();
+
+    assert_eq!(
+        last_subagent_stop_reason(&test._agent, &subagent.id(), cx),
+        Some(acp_v2::StopReason::Cancelled)
+    );
+}
+
+#[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_basic_tool_calls(cx: &mut TestAppContext) {
     let ThreadTest { thread, .. } = setup(cx, TestModel::Sonnet4).await;

@@ -1,6 +1,7 @@
 use acp_thread::{SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
 use agent_client_protocol::schema::v2 as acp_v2;
 use anyhow::Result;
+use futures::FutureExt as _;
 use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
@@ -123,6 +124,10 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
 }
 
 /// Tool that spawns an agent thread to work on a task.
+/// The result text of a subagent turn the user cancelled, which the
+/// subagent card recognises.
+pub const USER_CANCELED_OUTPUT: &str = "User canceled";
+
 pub struct SpawnAgentTool {
     environment: Rc<dyn ThreadEnvironment>,
 }
@@ -212,7 +217,14 @@ impl AgentTool for SpawnAgentTool {
                 Ok((subagent, session_info))
             })?;
 
-            let send_result = subagent.send(message, cx).await;
+            // Stopping the parent turn drops the subagent's task, its hooks
+            // included.
+            let send_result = futures::select_biased! {
+                _ = event_stream.cancelled_by_user().fuse() => {
+                    Err(anyhow::anyhow!(USER_CANCELED_OUTPUT))
+                }
+                result = subagent.send(message, cx).fuse() => result,
+            };
 
             let status = if send_result.is_ok() {
                 "completed"
