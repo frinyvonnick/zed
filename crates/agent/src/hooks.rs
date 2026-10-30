@@ -464,6 +464,11 @@ fn parse_command_output(
     let stdout = stdout.trim();
     let object = (stdout.starts_with('{') && stdout.ends_with('}'))
         .then(|| serde_json::from_str::<serde_json::Value>(stdout));
+    // A hook that succeeds can still warn, for example about settings it
+    // does not apply.
+    if exit_code == Some(0) && !stderr.trim().is_empty() {
+        log::info!("agent hook {hook_event_name}: {}", stderr.trim());
+    }
     match exit_code {
         Some(0) => match object {
             Some(object) => object.context("hook printed invalid JSON"),
@@ -1329,6 +1334,7 @@ impl ModelHooks {
         if let Some(fields) = event_fields.as_object_mut() {
             fields.insert("total_message_count".into(), json!(request.messages.len()));
             fields.insert("tool_names".into(), json!(tool_names));
+            fields.insert("skill_names".into(), json!(catalogue_skill_names(request)));
         }
 
         let mut inserts = Vec::new();
@@ -1337,6 +1343,8 @@ impl ModelHooks {
         let mut reminders = Vec::new();
         let mut reminder_chars = 0;
         let mut reminders_capped = false;
+        let mut removed_tools = Vec::<String>::new();
+        let mut removed_skills = Vec::<String>::new();
         for hook in &self.before_model {
             // Each hook gets the messages added since its own previous answer.
             let sent_key = (self.context.thread_id.clone(), hook_identity(hook));
@@ -1361,21 +1369,29 @@ impl ModelHooks {
                     continue;
                 }
             };
-            let (insert, hook_reminders, replacements, max_output_tokens) =
-                match check_model_hook_output("BeforeModel", &output).and_then(|()| {
-                    Ok((
-                        system_prompt_insert(&output)?,
-                        ephemeral_messages(&output)?,
-                        tool_result_replacements(&output, request)?,
-                        hook_max_output_tokens(&output)?,
-                    ))
-                }) {
-                    Ok(fields) => fields,
-                    Err(error) => {
-                        log::warn!("BeforeModel hook output ignored: {error:#}");
-                        continue;
-                    }
-                };
+            let (
+                insert,
+                hook_reminders,
+                replacements,
+                max_output_tokens,
+                hook_removed_tools,
+                hook_removed_skills,
+            ) = match check_model_hook_output("BeforeModel", &output).and_then(|()| {
+                Ok((
+                    system_prompt_insert(&output)?,
+                    ephemeral_messages(&output)?,
+                    tool_result_replacements(&output, request)?,
+                    hook_max_output_tokens(&output)?,
+                    remove_tools(&output)?,
+                    remove_skills(&output)?,
+                ))
+            }) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    log::warn!("BeforeModel hook output ignored: {error:#}");
+                    continue;
+                }
+            };
             // The hook took these messages: the next request sends it only the
             // ones that follow. After a failure, they are sent again.
             cx.update(|cx| {
@@ -1385,6 +1401,17 @@ impl ModelHooks {
             });
             log_unsupported_output_fields(&output, &["/continue", "/systemMessage"]);
             replace_tool_results(request, replacements);
+            // The union of the lists of all hooks.
+            for (removed, names) in [
+                (&mut removed_tools, hook_removed_tools),
+                (&mut removed_skills, hook_removed_skills),
+            ] {
+                for name in names {
+                    if !removed.iter().any(|removed| removed == name) {
+                        removed.push(name.to_string());
+                    }
+                }
+            }
             if let Some(max_output_tokens) = max_output_tokens {
                 // Only lowers the reserve; a higher value is ignored.
                 let current = request.effective_max_output_tokens(model.max_output_tokens());
@@ -1426,6 +1453,8 @@ impl ModelHooks {
             insert_chars += added;
             inserts.push(insert.to_string());
         }
+        remove_request_tools(request, &removed_tools);
+        remove_request_skills(request, &removed_skills);
         // Reminders go last, in this request only: the conversation stays an
         // identical prefix from one request to the next. Summaries get none.
         if applies_ephemeral_messages(request) {
@@ -2371,6 +2400,130 @@ fn reminder_message(text: &str) -> LanguageModelRequestMessage {
         cache: false,
         reasoning_details: None,
     }
+}
+
+/// The `remove_tools` of a `BeforeModel` output: distinct, non-empty tool
+/// names.
+fn remove_tools(output: &serde_json::Value) -> Result<Vec<&str>> {
+    hook_names(output, "remove_tools")
+}
+
+/// The `remove_skills` of a `BeforeModel` output: distinct, non-empty skill
+/// names.
+fn remove_skills(output: &serde_json::Value) -> Result<Vec<&str>> {
+    hook_names(output, "remove_skills")
+}
+
+fn hook_names<'a>(output: &'a serde_json::Value, field: &str) -> Result<Vec<&'a str>> {
+    let names = match output.pointer(&format!("/hookSpecificOutput/{field}")) {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(names) => names
+            .as_array()
+            .with_context(|| format!("`{field}` must be a list of names"))?,
+    };
+    let mut removed = Vec::new();
+    for name in names {
+        let name = name
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .with_context(|| format!("`{field}` must be a list of names"))?;
+        anyhow::ensure!(!removed.contains(&name), "`{field}` names `{name}` twice");
+        removed.push(name);
+    }
+    Ok(removed)
+}
+
+/// One `<skill>` entry of the `<available_skills>` catalogue, with its name.
+static SKILL_ENTRY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)[ \t]*<skill>\s*<name>(.*?)</name>.*?</skill>\n?")
+        .expect("valid skill entry pattern")
+});
+
+/// The names in the `<available_skills>` catalogue of the system message of
+/// this request, sorted; none without a catalogue.
+fn catalogue_skill_names(request: &LanguageModelRequest) -> Vec<String> {
+    let mut names = request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            MessageContent::Text(text) => Some(text),
+            _ => None,
+        })
+        .filter_map(|text| {
+            let start = text.find("<available_skills>")?;
+            let end = text.find("</available_skills>")?;
+            (start < end).then(|| &text[start..end])
+        })
+        .flat_map(|catalogue| SKILL_ENTRY.captures_iter(catalogue))
+        .map(|entry| entry[1].to_string())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Removes the `<skill>` entries of these names from the `<available_skills>`
+/// catalogue in the system message of this request, not of the compaction
+/// request. Hiding a skill does not refuse it.
+fn remove_request_skills(request: &mut LanguageModelRequest, names: &[String]) {
+    if names.is_empty() || is_compaction_request(request) {
+        return;
+    }
+    let mut found = HashSet::default();
+    for message in &mut request.messages {
+        if message.role != Role::System {
+            continue;
+        }
+        for content in &mut message.content {
+            let MessageContent::Text(text) = content else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (
+                text.find("<available_skills>"),
+                text.find("</available_skills>"),
+            ) else {
+                continue;
+            };
+            if end < start {
+                continue;
+            }
+            let catalogue = SKILL_ENTRY
+                .replace_all(&text[start..end], |entry: &regex::Captures| {
+                    let name = &entry[1];
+                    if names.iter().any(|removed| removed == name) {
+                        found.insert(name.to_string());
+                        String::new()
+                    } else {
+                        entry[0].to_string()
+                    }
+                })
+                .into_owned();
+            text.replace_range(start..end, &catalogue);
+        }
+    }
+    for name in names {
+        if !found.contains(name) {
+            log::info!(
+                "a BeforeModel hook removes the skill `{name}`, which this request does not list"
+            );
+        }
+    }
+}
+
+/// Removes tools from the list this request shows the model, not from the
+/// compaction request; their calls are not refused.
+fn remove_request_tools(request: &mut LanguageModelRequest, names: &[String]) {
+    if names.is_empty() || is_compaction_request(request) {
+        return;
+    }
+    for name in names {
+        if !request.tools.iter().any(|tool| &tool.name == name) {
+            log::info!("a BeforeModel hook removes `{name}`, which this request does not have");
+        }
+    }
+    request.tools.retain(|tool| !names.contains(&tool.name));
 }
 
 /// The `system_prompt_insert` of a `BeforeModel` output. An empty text, or
@@ -5738,5 +5891,280 @@ pub(crate) mod tests {
         assert_eq!(output.unwrap(), "paused answer");
         assert!(block_calls.borrow().is_empty());
         assert_eq!(messages.borrow().len(), 1);
+    }
+    #[test]
+    fn test_remove_tools_are_validated() {
+        let output = |names: serde_json::Value| {
+            json!({
+                "hookSpecificOutput": { "hookEventName": "BeforeModel", "remove_tools": names }
+            })
+        };
+
+        assert_eq!(remove_tools(&json!({})).unwrap(), Vec::<&str>::new());
+        assert_eq!(
+            remove_tools(&output(json!(["terminal", "edit_file"]))).unwrap(),
+            vec!["terminal", "edit_file"]
+        );
+        assert!(remove_tools(&output(json!("terminal"))).is_err());
+        assert!(remove_tools(&output(json!([""]))).is_err());
+        assert!(remove_tools(&output(json!([42]))).is_err());
+        assert!(remove_tools(&output(json!(["terminal", "terminal"]))).is_err());
+    }
+
+    #[test]
+    fn test_removed_tools_leave_this_request_but_not_compaction() {
+        let tool = |name: &str| {
+            language_model::LanguageModelRequestTool::function(
+                name.into(),
+                String::new(),
+                json!({}),
+                false,
+            )
+        };
+        let conversation = LanguageModelRequest {
+            intent: Some(CompletionIntent::UserPrompt),
+            messages: vec![
+                message(Role::System, vec!["You are Zed.".into()]),
+                message(Role::User, vec!["Hello".into()]),
+            ],
+            tools: vec![tool("read_file"), tool("terminal")],
+            ..Default::default()
+        };
+        let names = |request: &LanguageModelRequest| {
+            request
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut request = conversation.clone();
+        remove_request_tools(&mut request, &["terminal".into(), "missing".into()]);
+        assert_eq!(names(&request), vec!["read_file".to_string()]);
+
+        let mut compaction = conversation.clone();
+        compaction.intent = Some(CompletionIntent::ThreadContextSummarization);
+        compaction
+            .messages
+            .push(message(Role::User, vec![COMPACTION_PROMPT.into()]));
+        remove_request_tools(&mut compaction, &["terminal".into()]);
+        assert_eq!(
+            names(&compaction),
+            vec!["read_file".to_string(), "terminal".to_string()]
+        );
+    }
+    /// Whether node, which runs the agent profiles hook, is missing; the
+    /// tests that need it are then skipped, with a message.
+    pub(crate) fn node_is_missing() -> bool {
+        let missing = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err();
+        if missing {
+            eprintln!("skipped: node is not installed, and the agent profiles hook needs it");
+        }
+        missing
+    }
+
+    /// The agent profiles hook of the contract answers each event with an
+    /// output its schema accepts.
+    #[gpui::test]
+    async fn test_agent_profiles_script_outputs_match_the_contract(cx: &mut TestAppContext) {
+        if node_is_missing() {
+            return;
+        }
+        cx.executor().allow_parking();
+        let profiles = Path::new(env!("CARGO_MANIFEST_DIR")).join("hook_contract/profils");
+        let data_dir = std::env::temp_dir().join(format!(
+            "zed-agent-profiles-schema-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let hook = CommandHook {
+            command: "node".into(),
+            args: Some(
+                [
+                    profiles.join("agent-profiles.mts"),
+                    "--agents".into(),
+                    profiles.join("test-agents"),
+                ]
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+            ),
+            shell: None,
+            timeout: Some(30),
+            data_dir: data_dir.clone(),
+        };
+        let root = HookContext {
+            session_id: "root-1".into(),
+            cwd: profiles.to_string_lossy().into_owned(),
+            thread_id: "root-1".into(),
+            parent_thread_id: None,
+            depth: 0,
+        };
+        let subagent = HookContext {
+            thread_id: "sub-1".into(),
+            parent_thread_id: Some("root-1".into()),
+            depth: 1,
+            ..root.clone()
+        };
+        let before_model = |context: &HookContext| {
+            context.input(
+                "BeforeModel",
+                json!({
+                    "request_id": "request-1",
+                    "intent": "user_prompt",
+                    "model": { "provider": "fake", "id": "fake" },
+                    "is_compaction": false,
+                    "new_messages": [],
+                    "known_message_count": 0,
+                    "total_message_count": 2,
+                    "max_output_tokens": 1000,
+                    "tool_names": ["edit_file", "fetch", "read_file", "spawn_agent", "write_file"],
+                    "skill_names": ["create-skill", "exploring-code", "tdd"],
+                }),
+            )
+        };
+        let spawn = |label: &str| {
+            root.input(
+                "PreToolUse",
+                json!({
+                    "tool_name": "spawn_agent",
+                    "tool_input": { "label": label, "message": "Find it." },
+                    "tool_use_id": "tool-1",
+                }),
+            )
+        };
+        let start = root.input(
+            "SubagentStart",
+            json!({ "agent_id": "sub-1", "agent_type": "[explorateur#a1b2] Find it." }),
+        );
+        let exchanges = [
+            ("BeforeModel", before_model(&root)),
+            ("PreToolUse", spawn("Find it.")),
+            ("PreToolUse", spawn("[explorateur] Find it.")),
+            ("SubagentStart", start),
+            ("BeforeModel", before_model(&subagent)),
+            (
+                "PreToolUse",
+                subagent.input(
+                    "PreToolUse",
+                    json!({
+                        "tool_name": "skill",
+                        "tool_input": { "name": "tdd" },
+                        "tool_use_id": "tool-2",
+                    }),
+                ),
+            ),
+        ];
+
+        for (event, input) in exchanges {
+            assert_matches_contract(&format!("{event}.input.schema.json"), &input);
+            let output = cx.update(|cx| hook.call(input, cx)).await.unwrap();
+            // SubagentStart only records the profile.
+            if event != "SubagentStart" {
+                assert_ne!(output, json!({}), "{event} gave no output");
+            }
+            assert_matches_contract(&format!("{event}.output.schema.json"), &output);
+        }
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn test_remove_skills_are_validated() {
+        let output = |names: serde_json::Value| {
+            json!({
+                "hookSpecificOutput": { "hookEventName": "BeforeModel", "remove_skills": names }
+            })
+        };
+
+        assert_eq!(remove_skills(&json!({})).unwrap(), Vec::<&str>::new());
+        assert_eq!(
+            remove_skills(&output(json!(["tdd", "create-skill"]))).unwrap(),
+            vec!["tdd", "create-skill"]
+        );
+        assert!(remove_skills(&output(json!("tdd"))).is_err());
+        assert!(remove_skills(&output(json!([""]))).is_err());
+        assert!(remove_skills(&output(json!(["tdd", "tdd"]))).is_err());
+    }
+
+    #[test]
+    fn test_removed_skills_leave_the_catalogue_of_this_request() {
+        let system = indoc::indoc! {"
+            You are Zed.
+
+            <available_skills>
+              <skill>
+                <name>tdd</name>
+                <description>Red, then green.</description>
+                <location>/home/me/.agents/skills/tdd/SKILL.md</location>
+              </skill>
+              <skill>
+                <name>exploring-code</name>
+                <description>Locate, then read.</description>
+                <location>/home/me/.agents/skills/exploring-code/SKILL.md</location>
+              </skill>
+            </available_skills>
+
+            To use a Skill: <name>tdd</name> stays outside the catalogue.
+        "};
+        let conversation = LanguageModelRequest {
+            intent: Some(CompletionIntent::UserPrompt),
+            messages: vec![
+                message(Role::System, vec![system.into()]),
+                message(Role::User, vec!["Hello".into()]),
+            ],
+            ..Default::default()
+        };
+
+        let mut request = conversation.clone();
+        remove_request_skills(&mut request, &["tdd".into(), "missing".into()]);
+        let text = request.messages[0].string_contents();
+        assert!(
+            !text.contains(
+                "<name>tdd</name>
+"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("<name>exploring-code</name>"), "{text}");
+        assert!(
+            text.contains(
+                "<available_skills>
+  <skill>
+    <name>exploring-code"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("stays outside the catalogue"), "{text}");
+        remove_request_skills(&mut request, &["exploring-code".into()]);
+        let text = request.messages[0].string_contents();
+        assert!(
+            text.contains(
+                "<available_skills>
+</available_skills>"
+            ),
+            "{text}"
+        );
+
+        let mut compaction = conversation.clone();
+        compaction.intent = Some(CompletionIntent::ThreadContextSummarization);
+        compaction
+            .messages
+            .push(message(Role::User, vec![COMPACTION_PROMPT.into()]));
+        remove_request_skills(&mut compaction, &["tdd".into()]);
+        assert_eq!(compaction.messages[0].string_contents(), system);
+
+        assert_eq!(
+            catalogue_skill_names(&conversation),
+            vec!["exploring-code".to_string(), "tdd".to_string()]
+        );
+        let mut without_catalogue = conversation.clone();
+        without_catalogue.messages[0] = message(Role::System, vec!["You are Zed.".into()]);
+        assert_eq!(
+            catalogue_skill_names(&without_catalogue),
+            Vec::<String>::new()
+        );
     }
 }

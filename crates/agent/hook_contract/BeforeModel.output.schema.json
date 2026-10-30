@@ -29,6 +29,26 @@
           "description": "Lowers the output ceiling of this request. A value above the current one is ignored.",
           "minimum": 1
         },
+        "remove_tools": {
+          "type": "array",
+          "description": "Zed extension. Names of tools removed from the tool list of THIS request only: the model does not see them. A name absent from the request is ignored and logged. Generic: Zed knows nothing of why (a profile, a guard). Several hooks: the union of their lists. Ignored for the compaction request (is_compaction true). Removing a tool from the list does not refuse a call to it: a guard that must forbid a tool still denies it in PreToolUse.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Name of one tool, as sent to the model."
+          }
+        },
+        "remove_skills": {
+          "type": "array",
+          "description": "Zed extension. Names of skills removed from the <available_skills> catalogue of the system message of THIS request only (crates/agent/src/templates/system_prompt.hbs:231-239): each <skill> entry whose <name> is listed is dropped. A name absent from the catalogue is ignored and logged. If every entry is removed, the block stays, empty; a hook that wants no skill at all also removes the skill tool with remove_tools. Generic: Zed knows nothing of why. Several hooks: the union of their lists. Ignored for the compaction request (is_compaction true). Hiding a skill does not refuse it: a guard still denies it in PreToolUse.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Name of one skill, as written in its <name> entry."
+          }
+        },
         "tool_result_replacements": {
           "type": "array",
           "description": "Tool results to replace in this request only (for example a shortened result with a note).",

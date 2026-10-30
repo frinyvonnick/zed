@@ -2700,6 +2700,272 @@ async fn test_tokens_before_a_message_skip_a_pause_message(cx: &mut TestAppConte
     );
 }
 
+#[gpui::test]
+async fn test_before_model_remove_tools_hides_tools_from_this_request(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let output = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "BeforeModel",
+            "remove_tools": [EchoTool::NAME, "missing_tool"],
+        }
+    });
+    crate::hooks::tests::assert_matches_contract("BeforeModel.output.schema.json", &output);
+    let (hook, calls) = recording_hook(output);
+    cx.update(|cx| cx.set_global(model_hooks(vec![hook], Vec::new())));
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let request = fake.pending_completions().pop().unwrap();
+    assert!(
+        request.tools.iter().all(|tool| tool.name != EchoTool::NAME),
+        "{:?}",
+        request
+            .tools
+            .iter()
+            .map(|tool| &tool.name)
+            .collect::<Vec<_>>()
+    );
+    let calls = calls.lock().unwrap();
+    assert!(
+        calls[0]["tool_names"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(EchoTool::NAME))
+    );
+}
+
+/// Runs the app until `done` holds: real hook processes answer in real time.
+fn run_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        cx.run_until_parked();
+        if done(cx) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the hooks"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn tool_use(id: &str, name: &str, input: serde_json::Value) -> LanguageModelCompletionEvent {
+    LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+        id: id.into(),
+        name: name.into(),
+        raw_input: input.to_string(),
+        input: language_model::LanguageModelToolUseInput::Json(input),
+        is_input_complete: true,
+        thought_signature: None,
+    })
+}
+
+fn request_tool_names(request: &LanguageModelRequest) -> Vec<String> {
+    request.tools.iter().map(|tool| tool.name.clone()).collect()
+}
+
+fn last_tool_result_of(request: &LanguageModelRequest) -> LanguageModelToolResult {
+    let Some(MessageContent::ToolResult(tool_result)) = request
+        .messages
+        .last()
+        .and_then(|message| message.content.first())
+    else {
+        panic!("expected a tool result in the last request message");
+    };
+    tool_result.clone()
+}
+
+/// The agent profiles hook of the contract, run by node with the test
+/// profiles: the root conversation runs `pilote`, which may only launch the
+/// profiles of its list, and an `explorateur` subagent can only read.
+#[gpui::test]
+async fn test_agent_profiles_hook_keeps_an_explorer_read_only(cx: &mut TestAppContext) {
+    if crate::hooks::tests::node_is_missing() {
+        return;
+    }
+    let fake = init_test(cx);
+    cx.executor().allow_parking();
+    let profiles = Path::new(env!("CARGO_MANIFEST_DIR")).join("hook_contract/profils");
+    let data_root = std::env::temp_dir().join(format!(
+        "zed-agent-profiles-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let command = json!({
+        "type": "command",
+        "id": "agent-profiles",
+        "command": "node",
+        "args": [
+            profiles.join("agent-profiles.mts").to_string_lossy(),
+            "--agents",
+            profiles.join("test-agents").to_string_lossy(),
+        ],
+    });
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+        cx.set_global(crate::hooks::HookDataRoot(data_root.clone()));
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.agent.get_or_insert_default().hooks = Some(json!({
+                    "BeforeModel": [{ "hooks": [command.clone()] }],
+                    "PreToolUse": [{ "hooks": [command.clone()] }],
+                    "SubagentStart": [{ "hooks": [command] }],
+                }));
+            });
+        });
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/", json!({ "a": { "b.md": "Lorem" } }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = fake.model("fake");
+    thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+    cx.run_until_parked();
+    let root_id = session_id.to_string();
+    let pending = |thread_id: &str| {
+        let thread_id = thread_id.to_string();
+        let fake = fake.clone();
+        move || {
+            // Title requests are left aside.
+            fake.pending_completions()
+                .into_iter()
+                .filter(|request| {
+                    request.thread_id.as_deref() == Some(thread_id.as_str())
+                        && request.intent != Some(CompletionIntent::ThreadSummarization)
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let root_pending = pending(&root_id);
+
+    let _send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Prompt".into()], cx)
+    });
+    run_until(cx, |_| !root_pending().is_empty());
+    // The pilote profile: its section, and only its tools.
+    let request = root_pending().pop().unwrap();
+    let system = request.messages[0].string_contents();
+    assert!(system.contains("## Agent Profile"), "{system}");
+    assert!(system.contains("- explorateur: "), "{system}");
+    // pilote lists no skills: the catalogue keeps Zed's built-in one.
+    assert!(system.contains("<name>create-skill</name>"), "{system}");
+    let tools = request_tool_names(&request);
+    assert!(
+        tools.contains(&SpawnAgentTool::NAME.to_string()),
+        "{tools:?}"
+    );
+    assert!(!tools.contains(&"fetch".to_string()), "{tools:?}");
+
+    // A launch without a profile is denied with the allowed list.
+    let first_length = request.messages.len();
+    fake.send_event(
+        &model,
+        &request,
+        tool_use(
+            "spawn_1",
+            SpawnAgentTool::NAME,
+            json!({ "label": "où est lu le jeton ?", "message": "Find it." }),
+        ),
+    );
+    fake.end_stream(&model, &request);
+    run_until(cx, |_| {
+        root_pending()
+            .last()
+            .is_some_and(|request| request.messages.len() > first_length)
+    });
+    let request = root_pending().pop().unwrap();
+    let denial = last_tool_result_of(&request);
+    assert!(denial.is_error);
+    assert!(
+        format!("{:?}", denial.content).contains("[explorateur], [planificateur], [general]"),
+        "{:?}",
+        denial.content
+    );
+
+    // A launch with a profile starts an explorer.
+    fake.send_event(
+        &model,
+        &request,
+        tool_use(
+            "spawn_2",
+            SpawnAgentTool::NAME,
+            json!({ "label": "[explorateur] où est lu le jeton ?", "message": "Find it." }),
+        ),
+    );
+    fake.end_stream(&model, &request);
+    let subagent_request = || {
+        fake.pending_completions()
+            .into_iter()
+            .find(|request| request.thread_id.as_deref() != Some(root_id.as_str()))
+    };
+    run_until(cx, |_| subagent_request().is_some());
+    let request = subagent_request().unwrap();
+    let tools = request_tool_names(&request);
+    assert!(tools.contains(&"read_file".to_string()), "{tools:?}");
+    for write in ["edit_file", "write_file", "terminal", SpawnAgentTool::NAME] {
+        assert!(!tools.contains(&write.to_string()), "{tools:?}");
+    }
+    let system = request.messages[0].string_contents();
+    assert!(
+        system.contains("Tu es un explorateur en lecture seule."),
+        "{system}"
+    );
+    // explorateur allows only exploring-code: the built-in skill is hidden.
+    assert!(!system.contains("<name>create-skill</name>"), "{system}");
+
+    // A write it invents anyway is refused.
+    let length = request.messages.len();
+    let subagent_id = request.thread_id.clone().unwrap();
+    fake.send_event(
+        &model,
+        &request,
+        tool_use(
+            "write_1",
+            "write_file",
+            json!({ "path": "a/notes.md", "content": "x" }),
+        ),
+    );
+    fake.end_stream(&model, &request);
+    let subagent_pending = pending(&subagent_id);
+    run_until(cx, |_| {
+        subagent_pending()
+            .last()
+            .is_some_and(|request| request.messages.len() > length)
+    });
+    let refusal = last_tool_result_of(&subagent_pending().pop().unwrap());
+    assert!(refusal.is_error);
+    assert!(
+        format!("{:?}", refusal.content)
+            .contains("The write_file tool is not allowed for the explorateur profile."),
+        "{:?}",
+        refusal.content
+    );
+    assert!(!fs.is_file(path!("/a/notes.md").as_ref()).await);
+    std::fs::remove_dir_all(&data_root).ok();
+}
+
 /// A hook that answers with the next of its responses, then `{}`.
 struct SequenceHook {
     responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,

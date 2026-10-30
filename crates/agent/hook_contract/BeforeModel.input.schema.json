@@ -19,7 +19,8 @@
     "known_message_count",
     "total_message_count",
     "max_output_tokens",
-    "tool_names"
+    "tool_names",
+    "skill_names"
   ],
   "properties": {
     "hook_event_name": {
@@ -77,6 +78,14 @@
     "tool_names": {
       "type": "array",
       "description": "Names of the tools declared in this request, sorted; may be empty.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "skill_names": {
+      "type": "array",
+      "description": "Zed extension. Names of the skills in the <available_skills> catalogue of this request's system message, sorted; empty when there is no catalogue. Covers every source Zed reads (built-in skills, ~/.agents/skills, the .agents/skills of each open project), so a hook need not guess them. These are the names remove_skills accepts.",
       "items": {
         "type": "string",
         "minLength": 1

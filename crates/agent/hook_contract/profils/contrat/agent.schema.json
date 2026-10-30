@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/profils/agent.schema.json",
+  "title": "Zed agent profile frontmatter",
+  "description": "YAML frontmatter of an agent profile file, compatible with the Claude Code subagent file format (sources/claude-code-sub-agents-2026-10-30.md:291). The Markdown body after the closing --- is the system prompt (sources/claude-code-sub-agents-2026-10-30.md:270). Top level open: Claude Code ignores a field it does not recognize without reporting an error (sources/claude-code-sub-agents-2026-10-30.md:295), so a file written for a newer Claude Code must still load; Zed logs unknown fields. Zed-only fields live under `zed`, which is closed. Locations: personal profiles in the Zed configuration directory, project profiles in .zed/agents/.",
+  "type": "object",
+  "required": [
+    "name",
+    "description"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:302). Unique identifier, at most 256 characters, no `:`, must not start with `-` (sources/claude-code-sub-agents-2026-10-30.md:339). Hooks receive it as `agent_type`.",
+      "pattern": "^[^:\\-][^:]{0,255}$"
+    },
+    "description": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:303). When the main agent should delegate to this profile.",
+      "minLength": 1
+    },
+    "tools": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:304). Allowed tools, as a comma-separated string or a YAML list; inherits every tool if omitted. Holds Claude Code tool names; Zed uses `zed.tools` when present.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "disallowedTools": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:305). Denied tools, same format as `tools`; applied before `tools` (sources/claude-code-sub-agents-2026-10-30.md:450).",
+      "items": {
+        "type": "string"
+      }
+    },
+    "model": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:306). `sonnet`, `opus`, `haiku`, `fable`, a full model id, or `inherit`. Zed uses `zed.model` when present; a Claude alias has no meaning on a Zed provider such as vLLM."
+    },
+    "permissionMode": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:307). Accepted, not applied by Zed 0.1: Zed writes a warning naming the field when it loads the profile.",
+      "enum": [
+        "default",
+        "acceptEdits",
+        "auto",
+        "dontAsk",
+        "bypassPermissions",
+        "plan",
+        "manual"
+      ]
+    },
+    "maxTurns": {
+      "type": "integer",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:308). Accepted and ignored by Zed (decided): a turn ceiling cuts the model, which the repository doctrine forbids. Zed writes this in its log when it loads the profile."
+    },
+    "autoCompactWindow": {
+      "type": "integer",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:309). Lower auto-compact window, in tokens.",
+      "minimum": 100000,
+      "maximum": 1000000
+    },
+    "skills": {
+      "type": "array",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:310). Skills preloaded into the context at startup, up to the first 32 distinct names (sources/claude-code-sub-agents-2026-10-30.md:627). Does not restrict which skills can be invoked.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "mcpServers": {
+      "type": "array",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:311). Each entry is a configured server name, or an inline definition keyed by server name. Accepted, not applied by Zed 0.1: Zed writes a warning naming the field when it loads the profile.",
+      "items": {
+        "type": [
+          "string",
+          "object"
+        ],
+        "description": "Server name, or an object mapping one server name to its MCP config (open: the MCP config format is defined by MCP settings, not here).",
+        "additionalProperties": {
+          "type": "object",
+          "description": "MCP server config, not interpreted by this schema (open: defined by the MCP settings).",
+          "additionalProperties": true
+        },
+        "required": []
+      }
+    },
+    "hooks": {
+      "type": "object",
+      "$ref": "../schemas/settings.schema.json",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:312). Hooks active only while this agent runs, in the format of the hook settings. Restricted to the Zed events of the hook contract. A `Stop` hook becomes `SubagentStop` when the agent runs as a subagent (sources/claude-code-sub-agents-2026-10-30.md:799). Refused in a project profile (.zed/agents/): Zed refuses to load the profile, with a message naming the file, as project settings cannot declare hooks. Allowed in a personal profile (Zed configuration directory)."
+    },
+    "memory": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:313). Persistent memory scope. Accepted, not applied by Zed 0.1: Zed writes a warning naming the field when it loads the profile.",
+      "enum": [
+        "user",
+        "project",
+        "local"
+      ]
+    },
+    "background": {
+      "type": "boolean",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:314). Accepted, not applied by Zed 0.1: Zed writes a warning naming the field when it loads the profile."
+    },
+    "omitClaudeMd": {
+      "type": "boolean",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:315). Start without the user, project and local CLAUDE.md files. In Zed: without the project rules files."
+    },
+    "effort": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:316). Effort level; available levels depend on the model.",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "isolation": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:317). Run in a temporary git worktree. Accepted, not applied by Zed 0.1: Zed writes a warning naming the field when it loads the profile.",
+      "enum": [
+        "worktree"
+      ]
+    },
+    "color": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:318). Display color. Accepted, not applied by Zed 0.1: Zed writes a warning naming the field when it loads the profile.",
+      "enum": [
+        "red",
+        "blue",
+        "green",
+        "yellow",
+        "purple",
+        "orange",
+        "pink",
+        "cyan"
+      ]
+    },
+    "initialPrompt": {
+      "type": "string",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:319). First user turn when the agent runs as the main agent. Accepted, not applied by Zed 0.1: Zed writes a warning naming the field when it loads the profile."
+    },
+    "experimental": {
+      "type": "object",
+      "description": "Claude Code field (sources/claude-code-sub-agents-2026-10-30.md:320). Map of experimental options; only `cacheTtl` is documented (sources/claude-code-sub-agents-2026-10-30.md:322). Open: Claude Code ignores other keys. Accepted, not applied by Zed 0.1: Zed writes a warning naming the field when it loads the profile.",
+      "required": [],
+      "additionalProperties": true,
+      "properties": {
+        "cacheTtl": {
+          "type": "string",
+          "description": "Prompt cache lifetime.",
+          "enum": [
+            "5m",
+            "1h"
+          ]
+        }
+      }
+    },
+    "zed": {
+      "type": "object",
+      "description": "Zed extension. Fields that have no Claude Code counterpart, or whose Claude Code value cannot apply to Zed. Closed.",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "description": "Zed extension. Allowed tools by Zed name (`read_file`, `grep`, `terminal`…). Replaces `tools` in Zed; enforced by the tool filter in enabled_tools, so a refused tool is not even shown to the model. Subagent allowlist, on the model of Claude Code `Agent(worker, researcher)` (sources/claude-code-sub-agents-2026-10-30.md:513, sources/claude-code-sub-agents-2026-10-30.md:517): `spawn_agent(explorer, planner)` allows only those profiles; `spawn_agent` without parentheses allows every profile (sources/claude-code-sub-agents-2026-10-30.md:519); no `spawn_agent` entry means no subagent (sources/claude-code-sub-agents-2026-10-30.md:525). This list is the only source of truth for which profiles the agent may spawn.",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z_]+(\\([^()]*\\))?$",
+            "description": "A Zed tool name, optionally followed by a parenthesised, comma-separated list of profile names (only meaningful for spawn_agent)."
+          }
+        },
+        "disallowed_tools": {
+          "type": "array",
+          "description": "Zed extension. Denied tools by Zed name. Applied before `zed.tools`, as in Claude Code.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "model": {
+          "type": "object",
+          "description": "Zed extension. Model of the agent, as a Zed provider and model id.",
+          "additionalProperties": false,
+          "required": [
+            "provider",
+            "id"
+          ],
+          "properties": {
+            "provider": {
+              "type": "string",
+              "description": "Zed provider id, for example `openai_compatible`.",
+              "minLength": 1
+            },
+            "id": {
+              "type": "string",
+              "description": "Model id as configured in Zed.",
+              "minLength": 1
+            }
+          }
+        },
+        "max_spawn_depth": {
+          "type": "integer",
+          "description": "Zed extension. Deepest subagent level this agent may create (0: it may not spawn subagents). Enforced at create_subagent: a refused spawn returns a reason to the model, which goes on.",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "session_id": "th_8f2c1a",
+  "transcript_path": null,
+  "cwd": "C:/Users/friny/Documents/Workspace/snotra-dev",
+  "hook_event_name": "BeforeModel",
+  "request_id": "9e1f2a3b-4c5d-4e6f-8a7b-0c1d2e3f4a5b",
+  "intent": "tool_results",
+  "model": {
+    "provider": "openai_compatible",
+    "id": "qwen3.8-35b-a3b"
+  },
+  "is_compaction": false,
+  "new_messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Résumé de la conversation compactée : objectif, fichiers touchés, questions ouvertes."
+        }
+      ]
+    }
+  ],
+  "known_message_count": 0,
+  "total_message_count": 1,
+  "max_output_tokens": 32768,
+  "zed": {
+    "contract_version": "0.1.0",
+    "thread_id": "th_8f2c1a",
+    "parent_thread_id": null,
+    "is_subagent": false,
+    "depth": 0,
+    "timestamp": "2026-10-30T10:12:03.418Z"
+  },
+  "tool_names": [
+    "edit_file",
+    "find_path",
+    "grep",
+    "list_directory",
+    "read_file",
+    "skill",
+    "spawn_agent",
+    "terminal",
+    "write_file"
+  ],
+  "skill_names": [
+    "create-skill",
+    "implement-story",
+    "plan-story"
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "session_id": "th_8f2c1a",
+  "transcript_path": null,
+  "cwd": "C:/Users/friny/Documents/Workspace/snotra-dev",
+  "hook_event_name": "BeforeModel",
+  "request_id": "5b0d6c9e-2f3a-4e7b-9c1d-8a2e4f6b0c13",
+  "intent": "user_prompt",
+  "model": {
+    "provider": "openai_compatible",
+    "id": "qwen3.8-35b-a3b"
+  },
+  "is_compaction": false,
+  "new_messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Trouve où est lu le jeton de session."
+        }
+      ]
+    }
+  ],
+  "known_message_count": 0,
+  "total_message_count": 2,
+  "max_output_tokens": 32768,
+  "zed": {
+    "contract_version": "0.1.0",
+    "thread_id": "th_8f2c1a",
+    "parent_thread_id": null,
+    "is_subagent": false,
+    "depth": 0,
+    "timestamp": "2026-10-30T10:12:03.418Z"
+  },
+  "tool_names": [
+    "edit_file",
+    "find_path",
+    "grep",
+    "list_directory",
+    "read_file",
+    "skill",
+    "spawn_agent",
+    "terminal",
+    "write_file"
+  ],
+  "skill_names": [
+    "create-skill",
+    "implement-story",
+    "plan-story"
+  ]
+}
