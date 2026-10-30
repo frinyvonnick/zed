@@ -216,6 +216,8 @@ struct ProjectState {
     skills: Arc<Vec<Skill>>,
     skill_loading_issues: Vec<SkillLoadingIssue>,
     project_context_needs_refresh: watch::Sender<()>,
+    /// True once `project_context` has been built at least once.
+    project_context_built: watch::Receiver<bool>,
     _maintain_project_context: Task<Result<()>>,
     context_server_registry: Entity<ContextServerRegistry>,
     _subscriptions: Vec<Subscription>,
@@ -1061,6 +1063,27 @@ impl NativeAgent {
         &self.models
     }
 
+    /// Resolves once the context of `project` (rules files, skills, user
+    /// instructions) has been built at least once, so that a first request
+    /// sent right after opening a project carries it.
+    pub fn project_context_ready(
+        &self,
+        project: &Entity<Project>,
+    ) -> impl Future<Output = ()> + use<> {
+        let built = self
+            .projects
+            .get(&project.entity_id())
+            .map(|state| state.project_context_built.clone());
+        async move {
+            let Some(mut built) = built else { return };
+            while !*built.borrow() {
+                if built.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
     fn get_or_create_project_state(
         &mut self,
         project: &Entity<Project>,
@@ -1120,6 +1143,7 @@ impl NativeAgent {
 
         let (project_context_needs_refresh_tx, project_context_needs_refresh_rx) =
             watch::channel(());
+        let (project_context_built_tx, project_context_built_rx) = watch::channel(false);
 
         self.projects.insert(
             project_id,
@@ -1129,11 +1153,13 @@ impl NativeAgent {
                 skills: Arc::new(Vec::new()),
                 skill_loading_issues: Vec::new(),
                 project_context_needs_refresh: project_context_needs_refresh_tx,
+                project_context_built: project_context_built_rx,
                 _maintain_project_context: cx.spawn(async move |this, cx| {
                     Self::maintain_project_context(
                         this,
                         project_id,
                         project_context_needs_refresh_rx,
+                        project_context_built_tx,
                         cx,
                     )
                     .await
@@ -1154,6 +1180,7 @@ impl NativeAgent {
         this: WeakEntity<Self>,
         project_id: EntityId,
         mut needs_refresh: watch::Receiver<()>,
+        mut built: watch::Sender<bool>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
         while needs_refresh.changed().await.is_ok() {
@@ -1229,6 +1256,7 @@ impl NativeAgent {
                 this.update_available_commands_for_project(project_id, cx);
                 this.publish_skill_index(cx);
             })?;
+            built.send(true).ok();
         }
 
         Ok(())
@@ -7264,6 +7292,42 @@ mod internal_tests {
         assert!(issues.is_empty(), "expected no issues, got: {issues:?}");
         let kept_names: Vec<&str> = kept.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(kept_names, vec!["visible"]);
+    }
+
+    #[gpui::test]
+    async fn test_project_context_ready_waits_for_the_first_build(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/a", json!({ ".rules": "Rule A" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/a")], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+        let connection = NativeAgentConnection(agent.clone());
+        let _acp_thread = cx
+            .update(|cx| {
+                Rc::new(connection).new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        // No `run_until_parked`: a headless run sends its message right away.
+        agent
+            .read_with(cx, |agent, _cx| agent.project_context_ready(&project))
+            .await;
+        agent.read_with(cx, |agent, cx| {
+            let state = agent.projects.get(&project.entity_id()).unwrap();
+            let worktrees = &state.project_context.read(cx).worktrees;
+            assert_eq!(worktrees.len(), 1);
+            assert_eq!(
+                worktrees[0].rules_file.as_ref().map(|rules| rules.text.as_str()),
+                Some("Rule A")
+            );
+        });
     }
 
     #[gpui::test]

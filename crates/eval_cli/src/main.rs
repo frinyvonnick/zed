@@ -158,6 +158,7 @@ const EXIT_TIMEOUT: i32 = 2;
 const EXIT_INTERRUPTED: i32 = 3;
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PROJECT_CONTEXT_TIMEOUT: Duration = Duration::from_secs(60);
 
 static TERMINATED: AtomicBool = AtomicBool::new(false);
 
@@ -877,13 +878,31 @@ async fn run_agent(
         .update(|cx| {
             connection
                 .clone()
-                .new_session(project, PathList::new(&[workdir]), cx)
+                .new_session(project.clone(), PathList::new(&[workdir]), cx)
         })
         .await
     {
         Ok(t) => t,
         Err(e) => return (Err(e).context("creating ACP session"), RunStats::default()),
     };
+
+    // The agent builds the project context (rules files, skills, user instructions) in the
+    // background: without this wait, the first request left without any of it.
+    let context_ready = cx.update(|cx| agent.read(cx).project_context_ready(&project));
+    let context_timeout = cx.background_executor().timer(PROJECT_CONTEXT_TIMEOUT);
+    let context_built = select_biased! {
+        _ = context_ready.fuse() => true,
+        _ = context_timeout.fuse() => false,
+    };
+    if !context_built {
+        return (
+            Err(anyhow::anyhow!(
+                "the project context (rules files, skills, user instructions) was not built within {}s",
+                PROJECT_CONTEXT_TIMEOUT.as_secs()
+            )),
+            RunStats::default(),
+        );
+    }
 
     let _subscription = cx.subscribe(&acp_thread, |acp_thread, event, cx| {
         log_acp_thread_event(&acp_thread, event, cx);
