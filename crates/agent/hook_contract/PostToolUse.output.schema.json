@@ -32,7 +32,7 @@
       "properties": {
         "hookEventName": {
           "type": "string",
-          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1064). Must be this event name.",
+          "description": "Claude Code field (sources/claude-code-2026-10-30.md:1064). Must be this event name; in Zed a mismatch is a hook failure.",
           "const": "PostToolUse"
         },
         "additionalContext": {

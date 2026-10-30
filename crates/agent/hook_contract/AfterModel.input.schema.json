@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/AfterModel.input.schema.json",
+  "title": "AfterModel input",
+  "description": "Fires when the response stream of a model request ends without error (provider wrapper). One generation, not a turn. Name from Gemini CLI (sources/gemini-cli-2026-10-30.md:225), where it fires per stream chunk; payload specific to Zed.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "request_id",
+    "intent",
+    "model",
+    "is_compaction",
+    "stop_reason",
+    "usage",
+    "duration_ms"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "AfterModel"
+    },
+    "request_id": {
+      "type": "string",
+      "description": "Identifier of the model request, shared by BeforeModel, AfterModel and ZedModelError.",
+      "format": "uuid"
+    },
+    "intent": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Zed CompletionIntent of the request, snake_case; null when Zed sets none.",
+      "enum": [
+        "user_prompt",
+        "subagent",
+        "tool_results",
+        "thread_summarization",
+        "thread_context_summarization",
+        "create_file",
+        "edit_file",
+        "inline_assist",
+        "terminal_inline_assist",
+        "generate_git_commit_message",
+        null
+      ]
+    },
+    "model": {
+      "type": "object",
+      "$ref": "model-message.schema.json#/$defs/Model",
+      "description": "Model of the request."
+    },
+    "is_compaction": {
+      "type": "boolean",
+      "description": "True when the request is the compaction summary (recognised by its instruction, not by intent alone)."
+    },
+    "stop_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Zed StopReason, snake_case; null if the stream ended without one.",
+      "enum": [
+        "end_turn",
+        "max_tokens",
+        "tool_use",
+        "refusal",
+        null
+      ]
+    },
+    "usage": {
+      "type": "object",
+      "$ref": "model-message.schema.json#/$defs/Usage",
+      "description": "Last usage reported by the provider."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "description": "Time from send to end of stream.",
+      "minimum": 0
+    }
+  },
+  "unevaluatedProperties": false
+}

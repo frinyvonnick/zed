@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/BeforeModel.input.schema.json",
+  "title": "BeforeModel input",
+  "description": "Fires before each model request of an agent conversation (provider wrapper). Name from Gemini CLI (sources/gemini-cli-2026-10-30.md:191); payload specific to Zed.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "request_id",
+    "intent",
+    "model",
+    "is_compaction",
+    "new_messages",
+    "known_message_count",
+    "total_message_count",
+    "max_output_tokens",
+    "tool_names"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "BeforeModel"
+    },
+    "request_id": {
+      "type": "string",
+      "description": "Identifier of the model request, shared by BeforeModel, AfterModel and ZedModelError.",
+      "format": "uuid"
+    },
+    "intent": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Zed CompletionIntent of the request, snake_case; null when Zed sets none.",
+      "enum": [
+        "user_prompt",
+        "subagent",
+        "tool_results",
+        "thread_summarization",
+        "thread_context_summarization",
+        "create_file",
+        "edit_file",
+        "inline_assist",
+        "terminal_inline_assist",
+        "generate_git_commit_message",
+        null
+      ]
+    },
+    "model": {
+      "type": "object",
+      "$ref": "model-message.schema.json#/$defs/Model",
+      "description": "Model of the request."
+    },
+    "is_compaction": {
+      "type": "boolean",
+      "description": "True when the request is the compaction summary (recognised by its instruction, not by intent alone)."
+    },
+    "new_messages": {
+      "type": "array",
+      "description": "Non-system messages of this request not yet sent to THIS hook for this thread. Computed per hook (key: thread id + handler identity), comparing non-system messages only, independently of the model. Never the whole conversation, including for the compaction request and the panel summary.",
+      "items": {
+        "type": "object",
+        "$ref": "model-message.schema.json"
+      }
+    },
+    "known_message_count": {
+      "type": "integer",
+      "description": "Number of non-system messages of this request already sent to this hook for this thread.",
+      "minimum": 0
+    },
+    "tool_names": {
+      "type": "array",
+      "description": "Names of the tools declared in this request, sorted; may be empty.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "total_message_count": {
+      "type": "integer",
+      "description": "Number of messages in the request.",
+      "minimum": 0
+    },
+    "max_output_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Output token ceiling of the request (Zed effective_max_output_tokens), null when the provider default applies.",
+      "minimum": 1
+    }
+  },
+  "unevaluatedProperties": false
+}

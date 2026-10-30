@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/BeforeModel.output.schema.json",
+  "title": "BeforeModel output",
+  "description": "Adjusts this request only; Zed history is never changed. No deny: a hook never cuts the model. Exit code 2 or a `decision` field is a non-blocking failure, logged with its reason; the request is sent. Closed: this event has no Claude Code counterpart to stay compatible with.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [],
+  "properties": {
+    "systemMessage": {
+      "type": "string",
+      "description": "Warning shown to the user in the agent panel."
+    },
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "Event-specific output.",
+      "additionalProperties": false,
+      "required": [
+        "hookEventName"
+      ],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "description": "Must be this event name; a mismatch is a hook failure.",
+          "const": "BeforeModel"
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "description": "Lowers the output ceiling of this request. A value above the current one is ignored.",
+          "minimum": 1
+        },
+        "tool_result_replacements": {
+          "type": "array",
+          "description": "Tool results to replace in this request only (for example a shortened result with a note).",
+          "items": {
+            "type": "object",
+            "description": "Zed extension. One replacement.",
+            "additionalProperties": false,
+            "required": [
+              "tool_use_id",
+              "text"
+            ],
+            "properties": {
+              "tool_use_id": {
+                "type": "string",
+                "description": "Id of the tool call whose result is replaced.",
+                "minLength": 1
+              },
+              "text": {
+                "type": "string",
+                "description": "Replacement text, including the note for the model."
+              }
+            }
+          }
+        },
+        "system_prompt_insert": {
+          "type": "string",
+          "description": "Text inserted into the system message of THIS request only, right before the `## System Information` heading of the Zed template (crates/agent/src/templates/system_prompt.hbs:144); if that heading is not found, at the end of the system message, and Zed writes a log line. Several hooks: texts are joined in declaration order (chain rule), separated by a blank line. The hook MUST return the same text from one request to the next while its inputs do not change: the server reuses the cached prompt prefix, and a text that changes (time, counter, random order) invalidates that cache on every request. Ignored for the compaction request (is_compaction true). At most 10000 characters for the JOINED text of all hooks of one request, the cap Claude Code puts on additionalContext (sources/claude-code-2026-10-30.md:1054): the text is resent with every request and counts in the context window. Beyond it, the inserts of the following hooks are ignored and logged.",
+          "minLength": 1,
+          "maxLength": 10000
+        }
+      }
+    }
+  }
+}

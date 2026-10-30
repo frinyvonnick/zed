@@ -3076,7 +3076,17 @@ impl Thread {
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
 
             let events = match provider {
-                Ok(provider) => provider.stream_completion(&model, request, cx).await,
+                Ok(provider) => {
+                    crate::hooks::stream_completion(
+                        &provider,
+                        &model,
+                        request,
+                        this,
+                        Some(cancellation_rx.clone()),
+                        cx,
+                    )
+                    .await
+                }
                 Err(error) => Err(error),
             };
             let (mut events, mut error) = match events {
@@ -3436,7 +3446,7 @@ impl Thread {
                     }
                     return Ok(ControlFlow::Continue(()));
                 }
-                result = provider.stream_completion(&model, request, cx).fuse() => result,
+                result = crate::hooks::stream_completion(&provider, &model, request, this, None, cx).fuse() => result,
             };
             let mut stream = stream?;
 
@@ -4168,10 +4178,10 @@ impl Thread {
                 let provider = cx
                     .update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))
                     .log_err()?;
-                let mut messages = provider
-                    .stream_completion(&model, request, cx)
-                    .await
-                    .log_err()?;
+                let mut messages =
+                    crate::hooks::stream_completion(&provider, &model, request, &this, None, cx)
+                        .await
+                        .log_err()?;
                 while let Some(event) = messages.next().await {
                     let event = event.log_err()?;
                     let text = match event {

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/AfterModel.output.schema.json",
+  "title": "AfterModel output",
+  "description": "Can rewrite the usage Zed records (for example the real size of a request that was shortened), which drives Zed compaction. Exit code 2 or a `decision` field is a non-blocking failure, logged with its reason. Closed: this event has no Claude Code counterpart to stay compatible with.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [],
+  "properties": {
+    "systemMessage": {
+      "type": "string",
+      "description": "Warning shown to the user in the agent panel."
+    },
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "Event-specific output.",
+      "additionalProperties": false,
+      "required": [
+        "hookEventName"
+      ],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "description": "Must be this event name; a mismatch is a hook failure.",
+          "const": "AfterModel"
+        },
+        "usage": {
+          "type": "object",
+          "$ref": "model-message.schema.json#/$defs/Usage",
+          "description": "Usage that replaces the reported one."
+        }
+      }
+    }
+  }
+}

@@ -932,7 +932,7 @@ async fn test_pre_tool_use_hook_denies_tool_call(cx: &mut TestAppContext) {
                 matcher: Some(EchoTool::NAME.into()),
                 hooks: vec![Arc::new(DenyHook("Echo is not allowed here."))],
             }],
-            post_tool_use: Vec::new(),
+            ..Default::default()
         });
     });
     let runs = Arc::new(AtomicUsize::new(0));
@@ -1025,6 +1025,673 @@ async fn test_command_hook_from_settings_denies_tool_call(cx: &mut TestAppContex
     assert_eq!(tool_result.content, vec!["Echo is off.".into()]);
     assert_eq!(runs.load(Ordering::SeqCst), 0);
     assert_eq!(hook_dirs, 1);
+}
+
+/// A hook that answers with `response` and records its inputs.
+struct RecordingHook {
+    response: serde_json::Value,
+    calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl crate::hooks::HookHandler for RecordingHook {
+    fn call(&self, input: serde_json::Value, _cx: &mut App) -> Task<Result<serde_json::Value>> {
+        self.calls.lock().unwrap().push(input);
+        Task::ready(Ok(self.response.clone()))
+    }
+}
+
+fn recording_hook(
+    response: serde_json::Value,
+) -> (
+    Arc<dyn crate::hooks::HookHandler>,
+    Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook = Arc::new(RecordingHook {
+        response,
+        calls: calls.clone(),
+    });
+    (hook, calls)
+}
+
+fn model_hooks(
+    before_model: Vec<Arc<dyn crate::hooks::HookHandler>>,
+    after_model: Vec<Arc<dyn crate::hooks::HookHandler>>,
+) -> crate::hooks::AgentHooks {
+    crate::hooks::AgentHooks {
+        before_model: vec![crate::hooks::HookMatcherGroup {
+            matcher: None,
+            hooks: before_model,
+        }],
+        after_model: vec![crate::hooks::HookMatcherGroup {
+            matcher: None,
+            hooks: after_model,
+        }],
+        ..Default::default()
+    }
+}
+
+fn profile_insert_hook() -> (
+    Arc<dyn crate::hooks::HookHandler>,
+    Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) {
+    recording_hook(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "BeforeModel",
+            "system_prompt_insert": "## Agent Profile\nExplorer.",
+        }
+    }))
+}
+
+fn system_text(request: &LanguageModelRequest) -> String {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .flat_map(|message| &message.content)
+        .filter_map(|part| match part {
+            MessageContent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[gpui::test]
+async fn test_before_model_inserts_the_same_text_and_sees_new_messages_only(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (insert, calls) = profile_insert_hook();
+    cx.update(|cx| cx.set_global(model_hooks(vec![insert], Vec::new())));
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let first_request = fake.pending_completions().pop().unwrap();
+    let system = system_text(&first_request);
+    assert!(
+        system.contains("## Agent Profile\nExplorer.\n\n## System Information"),
+        "{system}"
+    );
+
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+
+    let second_request = fake.pending_completions().pop().unwrap();
+    assert_eq!(system_text(&second_request), system);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["known_message_count"], 0);
+    let first_new_messages = calls[0]["new_messages"].as_array().unwrap();
+    assert!(
+        first_new_messages
+            .iter()
+            .all(|message| message["role"] != "system")
+    );
+    assert_eq!(
+        first_new_messages.len() as u64,
+        calls[0]["total_message_count"].as_u64().unwrap() - 1
+    );
+    assert_eq!(
+        calls[1]["known_message_count"].as_u64().unwrap(),
+        first_new_messages.len() as u64
+    );
+    let new_messages = calls[1]["new_messages"].as_array().unwrap();
+    assert_eq!(new_messages.len(), 2);
+    assert_eq!(new_messages[0]["role"], "assistant");
+    assert_eq!(new_messages[0]["content"][0]["type"], "tool_use");
+    assert_eq!(new_messages[1]["role"], "user");
+    assert_eq!(new_messages[1]["content"][0]["type"], "tool_result");
+    let tool_names = calls[0]["tool_names"]
+        .as_array()
+        .expect("tool_names")
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"echo"), "{tool_names:?}");
+    assert!(tool_names.is_sorted(), "{tool_names:?}");
+    for call in calls.iter() {
+        crate::hooks::tests::assert_matches_contract("BeforeModel.input.schema.json", call);
+    }
+    // The insert is for the requests only: the thread keeps no trace of it.
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    assert!(!markdown.contains("Explorer."), "{markdown}");
+}
+
+#[gpui::test]
+async fn test_after_model_reports_stop_reason_and_usage(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (before, before_calls) = recording_hook(json!({}));
+    let (after, after_calls) = recording_hook(json!({}));
+    cx.update(|cx| cx.set_global(model_hooks(vec![before], vec![after])));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+            input_tokens: 120,
+            output_tokens: 7,
+            ..TokenUsage::default()
+        }),
+    );
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::Stop(language_model::StopReason::EndTurn),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let after_calls = after_calls.lock().unwrap();
+    assert_eq!(after_calls.len(), 1);
+    let call = &after_calls[0];
+    assert_eq!(call["hook_event_name"], "AfterModel");
+    assert_eq!(call["stop_reason"], "end_turn");
+    assert_eq!(call["usage"]["input_tokens"], 120);
+    assert_eq!(call["usage"]["output_tokens"], 7);
+    assert_eq!(
+        call["request_id"],
+        before_calls.lock().unwrap()[0]["request_id"]
+    );
+    crate::hooks::tests::assert_matches_contract("AfterModel.input.schema.json", call);
+}
+
+#[gpui::test]
+async fn test_before_model_leaves_the_compaction_request_unchanged(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (insert, calls) = profile_insert_hook();
+    cx.update(|cx| {
+        cx.set_global(model_hooks(vec![insert], Vec::new()));
+        // Another model for the compaction: what the hook already received
+        // still counts.
+        LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+            registry.set_compaction_model(Some(fake.model("compactor")), cx)
+        });
+    });
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+            input_tokens: 950_000,
+            ..TokenUsage::default()
+        }),
+    );
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+
+    let compaction_request = fake.pending_completions().pop().unwrap();
+    assert_eq!(
+        compaction_request.intent,
+        Some(CompletionIntent::ThreadContextSummarization)
+    );
+    let system = system_text(&compaction_request);
+    assert!(!system.contains("Explorer."), "{system}");
+    let calls = calls.lock().unwrap();
+    let compaction_call = calls.last().unwrap();
+    assert_eq!(compaction_call["is_compaction"], true);
+    assert!(
+        compaction_call["known_message_count"].as_u64().unwrap() > 0,
+        "{compaction_call}"
+    );
+    let new_messages = compaction_call["new_messages"].as_array().unwrap();
+    assert!(
+        new_messages
+            .iter()
+            .all(|message| message["role"] != "system")
+    );
+    assert_eq!(
+        new_messages.last().unwrap()["content"][0]["text"],
+        COMPACTION_PROMPT
+    );
+}
+
+/// A hook that never answers, and records when Zed abandons it.
+struct NeverAnsweringHook {
+    called: Arc<AtomicBool>,
+    abandoned: Arc<AtomicBool>,
+}
+
+impl crate::hooks::HookHandler for NeverAnsweringHook {
+    fn call(&self, _input: serde_json::Value, cx: &mut App) -> Task<Result<serde_json::Value>> {
+        self.called.store(true, Ordering::SeqCst);
+        let abandoned = self.abandoned.clone();
+        cx.background_executor().spawn(async move {
+            let _abandoned = util::defer(move || abandoned.store(true, Ordering::SeqCst));
+            futures::future::pending::<()>().await;
+            unreachable!()
+        })
+    }
+}
+
+fn hook_groups(
+    groups: Vec<(Option<&str>, Arc<dyn crate::hooks::HookHandler>)>,
+) -> Vec<crate::hooks::HookMatcherGroup> {
+    groups
+        .into_iter()
+        .map(|(matcher, hook)| crate::hooks::HookMatcherGroup {
+            matcher: matcher.map(str::to_string),
+            hooks: vec![hook],
+        })
+        .collect()
+}
+
+#[gpui::test]
+async fn test_cancelling_during_before_model_sends_no_request(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let slow: Arc<dyn crate::hooks::HookHandler> = Arc::new(NeverAnsweringHook {
+        called: Arc::new(AtomicBool::new(false)),
+        abandoned: abandoned.clone(),
+    });
+    cx.update(|cx| cx.set_global(model_hooks(vec![slow], Vec::new())));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(fake.pending_completions(), Vec::new());
+
+    let _cancel = thread.update(cx, |thread, cx| thread.cancel(cx));
+    cx.run_until_parked();
+
+    assert!(abandoned.load(Ordering::SeqCst));
+    assert_eq!(fake.pending_completions(), Vec::new());
+}
+
+#[gpui::test]
+async fn test_before_model_hooks_each_see_their_own_new_messages(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (prompts_only, prompts_only_calls) = recording_hook(json!({}));
+    let (every_request, every_request_calls) = recording_hook(json!({}));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            before_model: hook_groups(vec![
+                (Some("user_prompt"), prompts_only),
+                (None, every_request),
+            ]),
+            ..Default::default()
+        })
+    });
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Done.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Again"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(every_request_calls.lock().unwrap().len(), 3);
+    let calls = prompts_only_calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[1]["known_message_count"].as_u64().unwrap(),
+        calls[0]["new_messages"].as_array().unwrap().len() as u64
+    );
+    let part_types = calls[1]["new_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+        .map(|part| part["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(part_types.contains(&"tool_use"), "{part_types:?}");
+    assert!(part_types.contains(&"tool_result"), "{part_types:?}");
+}
+
+#[gpui::test]
+async fn test_before_model_on_the_panel_summary_sees_new_messages_only(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (hook, calls) = recording_hook(json!({}));
+    cx.update(|cx| cx.set_global(model_hooks(vec![hook], Vec::new())));
+    thread.update(cx, |thread, cx| {
+        thread.set_summarization_model(Some(fake.model("summarizer")), cx)
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hi.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let _summary = thread.update(cx, |thread, cx| thread.summary(cx));
+    cx.run_until_parked();
+
+    let calls = calls.lock().unwrap();
+    let summary_call = calls
+        .iter()
+        .find(|call| call["intent"] == "thread_context_summarization")
+        .expect("the panel summary request should run the BeforeModel hooks");
+    assert_eq!(summary_call["is_compaction"], false);
+    assert!(
+        summary_call["known_message_count"].as_u64().unwrap() > 0,
+        "{summary_call}"
+    );
+    assert!(
+        (summary_call["new_messages"].as_array().unwrap().len() as u64)
+            < summary_call["total_message_count"].as_u64().unwrap(),
+        "{summary_call}"
+    );
+}
+
+#[gpui::test]
+async fn test_before_model_ignores_a_refusal_or_another_event_output(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let insert = |event: &str, text: &str| {
+        json!({
+            "hookSpecificOutput": { "hookEventName": event, "system_prompt_insert": text }
+        })
+    };
+    let mut refusal = insert("BeforeModel", "Refused.");
+    refusal["decision"] = json!("block");
+    refusal["reason"] = json!("No model for you.");
+    let (refusing, _) = recording_hook(refusal);
+    let (wrong_event, _) = recording_hook(insert("AfterModel", "Wrong event."));
+    let (kept, _) = recording_hook(insert("BeforeModel", "Kept."));
+    cx.update(|cx| cx.set_global(model_hooks(vec![refusing, wrong_event, kept], Vec::new())));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let request = fake.pending_completions().pop().unwrap();
+    let system = system_text(&request);
+    assert!(system.contains("Kept."), "{system}");
+    assert!(!system.contains("Refused."), "{system}");
+    assert!(!system.contains("Wrong event."), "{system}");
+}
+
+#[gpui::test]
+async fn test_before_model_inserts_are_capped_together(cx: &mut TestAppContext) {
+    let ThreadTest { fake, thread, .. } = setup(cx, TestModel::Fake).await;
+    let insert = |text: String| {
+        json!({
+            "hookSpecificOutput": { "hookEventName": "BeforeModel", "system_prompt_insert": text }
+        })
+    };
+    let (first, _) = recording_hook(insert("a".repeat(6_000)));
+    let (second, _) = recording_hook(insert("b".repeat(6_000)));
+    cx.update(|cx| cx.set_global(model_hooks(vec![first, second], Vec::new())));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let system = system_text(&fake.pending_completions().pop().unwrap());
+    assert!(system.contains(&"a".repeat(6_000)));
+    assert!(!system.contains(&"b".repeat(100)));
+}
+
+#[gpui::test]
+async fn test_after_model_that_never_answers_lets_the_turn_end(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let called = Arc::new(AtomicBool::new(false));
+    let never: Arc<dyn crate::hooks::HookHandler> = Arc::new(NeverAnsweringHook {
+        called: called.clone(),
+        abandoned: Arc::new(AtomicBool::new(false)),
+    });
+    cx.update(|cx| cx.set_global(model_hooks(Vec::new(), vec![never])));
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hi.");
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::Stop(language_model::StopReason::EndTurn),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let mut stopped = false;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, Ok(ThreadEvent::Stop(_))) {
+            stopped = true;
+        }
+    }
+    assert!(
+        stopped,
+        "the turn should end while the AfterModel hook runs"
+    );
+    assert!(called.load(Ordering::SeqCst));
+}
+
+/// A hook that fails on its first call, then answers `{}`; it records its
+/// inputs.
+struct FailingOnceHook {
+    calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl crate::hooks::HookHandler for FailingOnceHook {
+    fn call(&self, input: serde_json::Value, _cx: &mut App) -> Task<Result<serde_json::Value>> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.push(input);
+        if calls.len() == 1 {
+            Task::ready(Err(anyhow::anyhow!("first call fails")))
+        } else {
+            Task::ready(Ok(json!({})))
+        }
+    }
+}
+
+#[gpui::test]
+async fn test_before_model_resends_messages_a_failing_hook_did_not_take(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook: Arc<dyn crate::hooks::HookHandler> = Arc::new(FailingOnceHook {
+        calls: calls.clone(),
+    });
+    cx.update(|cx| cx.set_global(model_hooks(vec![hook], Vec::new())));
+    thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1]["known_message_count"], 0);
+    assert_eq!(
+        calls[1]["new_messages"][0]["content"][0]["text"],
+        "Use the echo tool"
+    );
+}
+
+#[gpui::test]
+async fn test_before_model_after_a_model_change_sees_new_messages_only(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (hook, calls) = recording_hook(json!({}));
+    cx.update(|cx| cx.set_global(model_hooks(vec![hook], Vec::new())));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hi.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let other_model = fake.model("other");
+    thread.update(cx, |thread, cx| thread.set_model(other_model, cx));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Again"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1]["model"]["id"], "other");
+    assert_eq!(calls[1]["known_message_count"], 1);
+    let new_messages = calls[1]["new_messages"].as_array().unwrap();
+    assert_eq!(new_messages.len(), 2);
+    assert_eq!(new_messages[0]["role"], "assistant");
+    assert_eq!(new_messages[1]["content"][0]["text"], "Again");
+}
+
+#[gpui::test]
+async fn test_before_model_filtered_on_summaries_sees_new_messages_only(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (hook, calls) = recording_hook(json!({}));
+    cx.update(|cx| {
+        cx.set_global(crate::hooks::AgentHooks {
+            before_model: hook_groups(vec![(Some("thread_context_summarization"), hook)]),
+            ..Default::default()
+        })
+    });
+    let summarizer = fake.model("summarizer");
+    thread.update(cx, |thread, cx| {
+        thread.set_summarization_model(Some(summarizer.clone()), cx)
+    });
+    for (prompt, reply) in [("Hello", "Hi."), ("Again", "Sure.")] {
+        thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), [prompt], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        fake.send_last_text(&model, reply);
+        fake.end_last(&model);
+        cx.run_until_parked();
+
+        let _summary = thread.update(cx, |thread, cx| thread.summary(cx));
+        cx.run_until_parked();
+        fake.send_last_text(&summarizer, "Summary.");
+        fake.end_last(&summarizer);
+        cx.run_until_parked();
+    }
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let first_count = calls[0]["new_messages"].as_array().unwrap().len() as u64;
+    // The first summary's own instruction is not part of the conversation,
+    // so the second summary gets everything after the first exchange.
+    assert!(calls[1]["known_message_count"].as_u64().unwrap() >= 2);
+    let new_messages = calls[1]["new_messages"].as_array().unwrap();
+    assert!(
+        (new_messages.len() as u64) < first_count + 3,
+        "{new_messages:?}"
+    );
+    assert!(
+        new_messages
+            .iter()
+            .all(|message| message["content"][0]["text"] != "Hello")
+    );
+}
+
+#[gpui::test]
+async fn test_released_thread_is_forgotten_by_model_hooks(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let (hook, _) = recording_hook(json!({}));
+    cx.update(|cx| cx.set_global(model_hooks(vec![hook], Vec::new())));
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hi.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+    assert_eq!(cx.update(crate::hooks::remembered_thread_count), 1);
+
+    drop(thread);
+    // Releases are handled when the next update ends.
+    cx.update(|_| {});
+    cx.run_until_parked();
+
+    assert_eq!(cx.update(crate::hooks::remembered_thread_count), 0);
 }
 
 #[gpui::test]

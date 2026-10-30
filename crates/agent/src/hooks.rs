@@ -3,23 +3,31 @@ use crate::{
     ToolInputSender,
 };
 use agent_client_protocol::schema::v2 as acp_v2;
-use agent_settings::AgentSettings;
+use agent_settings::{AgentSettings, COMPACTION_PROMPT};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
-use futures::{AsyncWriteExt as _, FutureExt as _};
-use gpui::{App, AsyncApp, Global, SharedString, Task};
-use language_model::{LanguageModelProviderId, LanguageModelToolResultContent};
+use futures::{AsyncWriteExt as _, FutureExt as _, StreamExt as _, channel::oneshot};
+use gpui::{App, AsyncApp, Entity, Global, SharedString, Task, WeakEntity};
+use language_model::{
+    CompactedContext, CompletionIntent, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelCompletionStream, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelToolResultContent, LanguageModelToolUseInput, MessageContent, Role, StopReason,
+    TokenUsage,
+};
 use regex::Regex;
 use serde_json::json;
 use settings::Settings as _;
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
+    hash::{DefaultHasher, Hash as _, Hasher as _},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 /// Version of the hook contract, sent to every hook as `zed.contract_version`.
 pub const HOOK_CONTRACT_VERSION: &str = "0.1.0";
@@ -51,6 +59,8 @@ pub struct HookContext {
 pub struct AgentHooks {
     pub pre_tool_use: Vec<HookMatcherGroup>,
     pub post_tool_use: Vec<HookMatcherGroup>,
+    pub before_model: Vec<HookMatcherGroup>,
+    pub after_model: Vec<HookMatcherGroup>,
 }
 
 impl Global for AgentHooks {}
@@ -72,6 +82,8 @@ impl AgentHooks {
         Ok(Self {
             pre_tool_use: matcher_groups_from_settings(&hooks["PreToolUse"], data_root),
             post_tool_use: matcher_groups_from_settings(&hooks["PostToolUse"], data_root),
+            before_model: matcher_groups_from_settings(&hooks["BeforeModel"], data_root),
+            after_model: matcher_groups_from_settings(&hooks["AfterModel"], data_root),
         })
     }
 }
@@ -115,12 +127,29 @@ fn is_valid_hook_id(id: &str) -> bool {
 fn check_hook_settings(hooks: &serde_json::Value) -> Result<()> {
     let mut seen = HashMap::<String, (String, &serde_json::Value)>::default();
     for (event, groups) in hooks.as_object().into_iter().flatten() {
+        anyhow::ensure!(
+            SUPPORTED_EVENTS.contains(&event.as_str()),
+            "hooks for `{event}` are not supported yet; Zed runs {}",
+            SUPPORTED_EVENTS.join(", ")
+        );
         for (group_ix, group) in groups.as_array().into_iter().flatten().enumerate() {
             if let Some(matcher) = group["matcher"].as_str()
                 && !is_name_matcher(matcher)
             {
                 Regex::new(matcher)
                     .with_context(|| format!("hook matcher {event}[{group_ix}].matcher"))?;
+            }
+            if let Some(matcher) = group["matcher"].as_str()
+                && matches!(event.as_str(), "BeforeModel" | "AfterModel")
+                && matcher_matches(Some(matcher), "thread_summarization")
+                && !MODEL_INTENTS
+                    .iter()
+                    .all(|intent| matcher_matches(Some(matcher), intent))
+            {
+                anyhow::bail!(
+                    "hook matcher {event}[{group_ix}].matcher: title requests \
+                     (`thread_summarization`) do not run hooks"
+                );
             }
             let handlers = group["hooks"].as_array().into_iter().flatten();
             for (handler_ix, handler) in handlers.enumerate() {
@@ -150,6 +179,9 @@ fn check_hook_settings(hooks: &serde_json::Value) -> Result<()> {
     }
     Ok(())
 }
+
+/// The events this version of Zed runs hooks for.
+const SUPPORTED_EVENTS: [&str; 4] = ["PreToolUse", "PostToolUse", "BeforeModel", "AfterModel"];
 
 fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
     anyhow::ensure!(
@@ -459,35 +491,42 @@ fn matching_hooks(groups: &[HookMatcherGroup], value: &str) -> Vec<Arc<dyn HookH
         .collect()
 }
 
+/// Calls `f` with the configured hooks, if any load.
+fn with_configured_hooks<R>(cx: &App, f: impl FnOnce(&AgentHooks) -> R) -> Option<R> {
+    // A global, when set, replaces the `agent.hooks` setting; tests use it to
+    // install in-process hooks.
+    if let Some(hooks) = cx.try_global::<AgentHooks>() {
+        return Some(f(hooks));
+    }
+    let settings = AgentSettings::get_global(cx).hooks.as_ref()?;
+    let data_root = cx
+        .try_global::<HookDataRoot>()
+        .map(|root| root.0.clone())
+        .unwrap_or_else(|| paths::data_dir().join("hooks"));
+    match AgentHooks::from_settings(settings, &data_root) {
+        Ok(hooks) => Some(f(&hooks)),
+        Err(error) => {
+            log::error!("agent hooks are not loaded: {error:#}");
+            None
+        }
+    }
+}
+
 /// Wraps every tool that a configured tool hook matches in a [`HookedTool`].
 pub(crate) fn wrap_tools(
     thread: &Thread,
     tools: &mut BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     cx: &App,
 ) {
-    // A global, when set, replaces the `agent.hooks` setting; tests use it to
-    // install in-process hooks.
-    let from_settings;
-    let hooks = match cx.try_global::<AgentHooks>() {
-        Some(hooks) => hooks,
-        None => {
-            let Some(settings) = &AgentSettings::get_global(cx).hooks else {
-                return;
-            };
-            let data_root = cx
-                .try_global::<HookDataRoot>()
-                .map(|root| root.0.clone())
-                .unwrap_or_else(|| paths::data_dir().join("hooks"));
-            match AgentHooks::from_settings(settings, &data_root) {
-                Ok(hooks) => from_settings = hooks,
-                Err(error) => {
-                    log::error!("agent hooks are not loaded: {error:#}");
-                    return;
-                }
-            }
-            &from_settings
-        }
-    };
+    with_configured_hooks(cx, |hooks| wrap_matching_tools(hooks, thread, tools, cx));
+}
+
+fn wrap_matching_tools(
+    hooks: &AgentHooks,
+    thread: &Thread,
+    tools: &mut BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
+    cx: &App,
+) {
     let context = HookContext::for_thread(thread, cx);
     for (tool_name, tool) in tools.iter_mut() {
         let pre_tool_use = matching_hooks(&hooks.pre_tool_use, tool_name);
@@ -784,6 +823,10 @@ impl AnyAgentTool for HookedTool {
                         HookOutcome::Failed => continue,
                         HookOutcome::Cancelled => return Err(cancelled_output()),
                     };
+                    if let Err(error) = check_event_name("PreToolUse", &output) {
+                        log::warn!("PreToolUse hook output ignored: {error:#}");
+                        continue;
+                    }
                     log_unsupported_fields(&output);
                     let specific = &output["hookSpecificOutput"];
                     let context = specific["additionalContext"].as_str();
@@ -868,6 +911,10 @@ impl AnyAgentTool for HookedTool {
                     // The tool already ran: keep its result, skip the other hooks.
                     HookOutcome::Cancelled => break,
                 };
+                if let Err(error) = check_event_name("PostToolUse", &hook_output) {
+                    log::warn!("PostToolUse hook output ignored: {error:#}");
+                    continue;
+                }
                 log_unsupported_fields(&hook_output);
                 if hook_output["decision"] == "block"
                     && let Some(reason) = hook_output["reason"]
@@ -899,12 +946,634 @@ impl AnyAgentTool for HookedTool {
     }
 }
 
+/// Streams a completion of `request` like `provider.stream_completion`, and
+/// runs the `BeforeModel` hooks before the request and the `AfterModel`
+/// hooks when the response ends. Cancelling through `cancellation` while the
+/// `BeforeModel` hooks run abandons them and sends no request.
+pub(crate) async fn stream_completion(
+    provider: &Arc<dyn LanguageModelProvider>,
+    model: &LanguageModel,
+    request: LanguageModelRequest,
+    thread: &WeakEntity<Thread>,
+    cancellation: Option<watch::Receiver<bool>>,
+    cx: &AsyncApp,
+) -> Result<LanguageModelCompletionStream, LanguageModelCompletionError> {
+    match cx.update(|cx| ModelHooks::for_request(thread, &request, cx)) {
+        Some(hooks) => {
+            hooks
+                .stream_completion(provider, model, request, cancellation, cx)
+                .await
+        }
+        None => provider.stream_completion(model, request, cx).await,
+    }
+}
+
+/// The hooks that run around one model request.
+struct ModelHooks {
+    context: HookContext,
+    before_model: Vec<Arc<dyn HookHandler>>,
+    after_model: Vec<Arc<dyn HookHandler>>,
+}
+
+impl ModelHooks {
+    fn for_request(
+        thread: &WeakEntity<Thread>,
+        request: &LanguageModelRequest,
+        cx: &mut App,
+    ) -> Option<Self> {
+        let intent = intent_name(request.intent).unwrap_or_default();
+        let (before_model, after_model) = with_configured_hooks(cx, |hooks| {
+            (
+                matching_hooks(&hooks.before_model, intent),
+                matching_hooks(&hooks.after_model, intent),
+            )
+        })?;
+        if before_model.is_empty() && after_model.is_empty() {
+            return None;
+        }
+        let thread = thread.upgrade()?;
+        let context = HookContext::for_thread(thread.read(cx), cx);
+        if !before_model.is_empty() {
+            forget_sent_messages_on_release(&thread, &context.thread_id, cx);
+        }
+        Some(Self {
+            context,
+            before_model,
+            after_model,
+        })
+    }
+
+    async fn stream_completion(
+        self,
+        provider: &Arc<dyn LanguageModelProvider>,
+        model: &LanguageModel,
+        mut request: LanguageModelRequest,
+        cancellation: Option<watch::Receiver<bool>>,
+        cx: &AsyncApp,
+    ) -> Result<LanguageModelCompletionStream, LanguageModelCompletionError> {
+        let request_fields = json!({
+            "request_id": Uuid::new_v4().to_string(),
+            "intent": intent_name(request.intent),
+            "model": {
+                "provider": model.provider_id().to_string(),
+                "id": model.id().0.to_string(),
+            },
+            "is_compaction": is_compaction_request(&request),
+        });
+        if !self.before_model.is_empty() {
+            let cancelled = {
+                let before_model = self.run_before_model(&request_fields, model, &mut request, cx);
+                let cancellation = wait_for_cancellation(cancellation);
+                futures::pin_mut!(before_model, cancellation);
+                matches!(
+                    futures::future::select(before_model, cancellation).await,
+                    futures::future::Either::Right(_)
+                )
+            };
+            // Dropping the hooks' tasks kills their processes; the caller sees
+            // the cancellation and no request leaves.
+            if cancelled {
+                return Ok(futures::stream::empty().boxed());
+            }
+        }
+
+        let started_at = Instant::now();
+        let stream = provider.stream_completion(model, request, cx).await?;
+        if self.after_model.is_empty() {
+            return Ok(stream);
+        }
+        let (end_tx, end_rx) = oneshot::channel();
+        cx.spawn(async move |cx| {
+            // The sender is dropped when the stream fails or is abandoned:
+            // AfterModel only observes generations that end normally.
+            let Ok(end) = end_rx.await else {
+                log::info!("AfterModel hooks skipped: the response stream did not end normally");
+                return;
+            };
+            self.run_after_model(request_fields, end, started_at, cx)
+                .await;
+        })
+        .detach();
+        Ok(observe_response_end(stream, end_tx))
+    }
+
+    /// Runs the `BeforeModel` hooks in declaration order and inserts their
+    /// texts into the system message of this request only.
+    async fn run_before_model(
+        &self,
+        request_fields: &serde_json::Value,
+        model: &LanguageModel,
+        request: &mut LanguageModelRequest,
+        cx: &AsyncApp,
+    ) {
+        let messages = request
+            .messages
+            .iter()
+            .map(message_to_contract)
+            .collect::<Vec<_>>();
+        // Only the conversation counts: the system message changes with the
+        // model, the date or the tools.
+        let conversation = messages
+            .iter()
+            .zip(&request.messages)
+            .filter(|(_, message)| message.role != Role::System)
+            .map(|(contract, _)| contract)
+            .collect::<Vec<_>>();
+        let conversation_hashes = conversation
+            .iter()
+            .map(|message| {
+                let mut hasher = DefaultHasher::new();
+                message.to_string().hash(&mut hasher);
+                hasher.finish()
+            })
+            .collect::<Vec<_>>();
+        let mut tool_names = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        tool_names.sort_unstable();
+        let mut event_fields = request_fields.clone();
+        if let Some(fields) = event_fields.as_object_mut() {
+            fields.insert("total_message_count".into(), json!(messages.len()));
+            fields.insert(
+                "max_output_tokens".into(),
+                json!(request.effective_max_output_tokens(model.max_output_tokens())),
+            );
+            fields.insert("tool_names".into(), json!(tool_names));
+        }
+
+        let mut inserts = Vec::new();
+        let mut insert_chars = 0;
+        let mut capped = false;
+        for hook in &self.before_model {
+            // Each hook gets the messages added since its own previous answer.
+            let sent_key = (self.context.thread_id.clone(), hook_identity(hook));
+            let known = cx.update(|cx| known_message_count(&sent_key, &conversation_hashes, cx));
+            let mut hook_fields = event_fields.clone();
+            if let Some(fields) = hook_fields.as_object_mut() {
+                fields.insert("new_messages".into(), json!(conversation[known..]));
+                fields.insert("known_message_count".into(), json!(known));
+            }
+            let input = self.context.input("BeforeModel", hook_fields);
+            let output = match cx.update(|cx| hook.call(input, cx)).await {
+                Ok(output) => output,
+                Err(error) => {
+                    log::warn!("BeforeModel hook failed, continuing: {error:#}");
+                    continue;
+                }
+            };
+            let insert = match check_model_hook_output("BeforeModel", &output)
+                .and_then(|()| system_prompt_insert(&output))
+            {
+                Ok(insert) => insert,
+                Err(error) => {
+                    log::warn!("BeforeModel hook output ignored: {error:#}");
+                    continue;
+                }
+            };
+            // The hook took these messages: the next request sends it only the
+            // ones that follow. After a failure, they are sent again.
+            cx.update(|cx| {
+                cx.default_global::<SentMessages>()
+                    .by_hook
+                    .insert(sent_key, conversation_hashes.clone());
+            });
+            log_unsupported_output_fields(
+                &output,
+                &[
+                    "/systemMessage",
+                    "/hookSpecificOutput/max_output_tokens",
+                    "/hookSpecificOutput/tool_result_replacements",
+                ],
+            );
+            let Some(insert) = insert else {
+                continue;
+            };
+            // The cap applies to the joined text of all hooks.
+            let separator = if inserts.is_empty() { 0 } else { 2 };
+            let added = insert.chars().count() + separator;
+            if capped || insert_chars + added > MAX_SYSTEM_PROMPT_INSERT_CHARS {
+                capped = true;
+                log::warn!(
+                    "BeforeModel texts exceed {MAX_SYSTEM_PROMPT_INSERT_CHARS} characters \
+                     together; the text of this hook is ignored"
+                );
+                continue;
+            }
+            insert_chars += added;
+            inserts.push(insert.to_string());
+        }
+        // A request without a system message (the panel summary) has no place
+        // for the text.
+        if !inserts.is_empty() && applies_system_prompt_insert(request) {
+            match insert_into_system_message(request, &inserts.join("\n\n")) {
+                InsertOutcome::BeforeHeading | InsertOutcome::NoSystemMessage => {}
+                InsertOutcome::AtEnd => log::info!(
+                    "the system message has no `{SYSTEM_INFORMATION_HEADING}` heading; \
+                     the BeforeModel text was added at its end"
+                ),
+            }
+        }
+    }
+
+    /// Runs the `AfterModel` hooks in declaration order. They observe the
+    /// generation; this version of Zed applies nothing they return.
+    async fn run_after_model(
+        &self,
+        mut event_fields: serde_json::Value,
+        end: ResponseEnd,
+        started_at: Instant,
+        cx: &AsyncApp,
+    ) {
+        if let Some(fields) = event_fields.as_object_mut() {
+            fields.insert(
+                "stop_reason".into(),
+                json!(end.stop_reason.map(stop_reason_name)),
+            );
+            fields.insert(
+                "usage".into(),
+                json!({
+                    "input_tokens": end.usage.input_tokens,
+                    "output_tokens": end.usage.output_tokens,
+                    "cache_creation_input_tokens": end.usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": end.usage.cache_read_input_tokens,
+                }),
+            );
+            fields.insert(
+                "duration_ms".into(),
+                json!(end.ended_at.duration_since(started_at).as_millis() as u64),
+            );
+        }
+        for hook in &self.after_model {
+            let input = self.context.input("AfterModel", event_fields.clone());
+            let output = match cx.update(|cx| hook.call(input, cx)).await {
+                Ok(output) => output,
+                Err(error) => {
+                    log::warn!("AfterModel hook failed: {error:#}");
+                    continue;
+                }
+            };
+            match check_model_hook_output("AfterModel", &output) {
+                Ok(()) => log_unsupported_output_fields(
+                    &output,
+                    &["/systemMessage", "/hookSpecificOutput/usage"],
+                ),
+                Err(error) => log::warn!("AfterModel hook output ignored: {error:#}"),
+            }
+        }
+    }
+}
+
+/// Resolves once `cancellation` is set; never without one.
+async fn wait_for_cancellation(cancellation: Option<watch::Receiver<bool>>) {
+    if let Some(mut cancellation) = cancellation {
+        loop {
+            if *cancellation.borrow() {
+                return;
+            }
+            if cancellation.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+    futures::future::pending::<()>().await
+}
+
+/// Model hooks never refuse: a refusal (exit code 2 or a `decision`) is a
+/// failure, as is an output for another event.
+fn check_model_hook_output(event: &str, output: &serde_json::Value) -> Result<()> {
+    if let Some(decision) = output.get("decision").filter(|value| !value.is_null()) {
+        anyhow::bail!(
+            "a {event} hook cannot refuse (decision {decision}); its reason: {}",
+            output["reason"].as_str().unwrap_or("none given")
+        );
+    }
+    check_event_name(event, output)
+}
+
+/// An output whose `hookSpecificOutput` names another event is a failure.
+fn check_event_name(event: &str, output: &serde_json::Value) -> Result<()> {
+    match output.get("hookSpecificOutput") {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(specific) => {
+            anyhow::ensure!(
+                specific["hookEventName"] == event,
+                "the output is for {}, not {event}",
+                specific["hookEventName"]
+            );
+            Ok(())
+        }
+    }
+}
+
+/// How a model response ended, as `AfterModel` reports it.
+struct ResponseEnd {
+    stop_reason: Option<StopReason>,
+    usage: TokenUsage,
+    ended_at: Instant,
+}
+
+/// Passes the response through unchanged, and sends how it ended once the
+/// stream finishes without error.
+fn observe_response_end(
+    stream: LanguageModelCompletionStream,
+    end_tx: oneshot::Sender<ResponseEnd>,
+) -> LanguageModelCompletionStream {
+    let end = ResponseEnd {
+        stop_reason: None,
+        usage: TokenUsage::default(),
+        ended_at: Instant::now(),
+    };
+    futures::stream::unfold(
+        (stream, Some((end_tx, end))),
+        |(mut stream, mut end)| async move {
+            let Some(event) = stream.next().await else {
+                if let Some((end_tx, mut end)) = end.take() {
+                    end.ended_at = Instant::now();
+                    end_tx.send(end).ok();
+                }
+                return None;
+            };
+            match (&event, end.as_mut()) {
+                (Ok(LanguageModelCompletionEvent::Stop(reason)), Some((_, end))) => {
+                    end.stop_reason = Some(*reason);
+                }
+                (Ok(LanguageModelCompletionEvent::UsageUpdate(usage)), Some((_, end))) => {
+                    end.usage = *usage;
+                }
+                (Err(_), _) => end = None,
+                _ => {}
+            }
+            Some((event, (stream, end)))
+        },
+    )
+    .boxed()
+}
+
+/// What each `BeforeModel` hook of each thread already took, so that it gets
+/// only the new messages.
+#[derive(Default)]
+struct SentMessages {
+    /// By thread id and hook identity: a hash of each non-system message of
+    /// the last request the hook answered.
+    by_hook: HashMap<(String, String), Vec<u64>>,
+    /// Threads whose release clears their entries.
+    watched_threads: HashSet<String>,
+}
+
+impl Global for SentMessages {}
+
+/// Identifies a hook across requests: its configuration for a command hook,
+/// which is rebuilt from the settings on each request.
+fn hook_identity(hook: &Arc<dyn HookHandler>) -> String {
+    hook.dedup_key()
+        .unwrap_or_else(|| format!("{:p}", Arc::as_ptr(hook)))
+}
+
+/// How many of the non-system `messages` this hook of this thread already
+/// took, unchanged and in order, whatever the request and the model.
+fn known_message_count(sent_key: &(String, String), messages: &[u64], cx: &mut App) -> usize {
+    cx.default_global::<SentMessages>()
+        .by_hook
+        .get(sent_key)
+        .map_or(0, |sent| {
+            sent.iter()
+                .zip(messages)
+                .take_while(|(sent, current)| sent == current)
+                .count()
+        })
+}
+
+/// Clears what the hooks of a thread received once the thread is released.
+fn forget_sent_messages_on_release(thread: &Entity<Thread>, thread_id: &str, cx: &mut App) {
+    if !cx
+        .default_global::<SentMessages>()
+        .watched_threads
+        .insert(thread_id.to_string())
+    {
+        return;
+    }
+    let released_thread_id = thread_id.to_string();
+    cx.observe_release(thread, move |_, cx| {
+        let sent = cx.default_global::<SentMessages>();
+        sent.by_hook
+            .retain(|(thread_id, _), _| *thread_id != released_thread_id);
+        sent.watched_threads.remove(&released_thread_id);
+    })
+    .detach();
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) fn remembered_thread_count(cx: &mut App) -> usize {
+    cx.default_global::<SentMessages>()
+        .by_hook
+        .keys()
+        .map(|(thread_id, _)| thread_id)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+const SYSTEM_INFORMATION_HEADING: &str = "## System Information";
+
+/// Where a `BeforeModel` text went.
+#[derive(Debug, PartialEq)]
+enum InsertOutcome {
+    BeforeHeading,
+    AtEnd,
+    NoSystemMessage,
+}
+
+/// Inserts `text` into the system message, right before its
+/// `## System Information` heading, or at its end when the heading is
+/// missing.
+fn insert_into_system_message(request: &mut LanguageModelRequest, text: &str) -> InsertOutcome {
+    let Some(system) = request
+        .messages
+        .iter_mut()
+        .find(|message| message.role == Role::System)
+    else {
+        return InsertOutcome::NoSystemMessage;
+    };
+    for part in &mut system.content {
+        if let MessageContent::Text(content) = part
+            && let Some(ix) = content
+                .match_indices(SYSTEM_INFORMATION_HEADING)
+                .map(|(ix, _)| ix)
+                .find(|&ix| ix == 0 || content[..ix].ends_with('\n'))
+        {
+            content.insert_str(ix, &format!("{text}\n\n"));
+            return InsertOutcome::BeforeHeading;
+        }
+    }
+    let last_text = system.content.iter_mut().rev().find_map(|part| match part {
+        MessageContent::Text(content) => Some(content),
+        _ => None,
+    });
+    match last_text {
+        Some(content) => content.push_str(&format!("\n\n{text}")),
+        None => system.content.push(MessageContent::Text(text.to_string())),
+    }
+    InsertOutcome::AtEnd
+}
+
+/// Whether the request is the compaction summary, recognised by its
+/// instruction rather than by its intent alone.
+fn is_compaction_request(request: &LanguageModelRequest) -> bool {
+    request.intent == Some(CompletionIntent::ThreadContextSummarization)
+        && request.messages.last().is_some_and(|message| {
+            message
+                .content
+                .iter()
+                .any(|part| matches!(part, MessageContent::Text(text) if text == COMPACTION_PROMPT))
+        })
+}
+
+/// Whether a `system_prompt_insert` applies to this request: not to the
+/// compaction summary.
+fn applies_system_prompt_insert(request: &LanguageModelRequest) -> bool {
+    !is_compaction_request(request)
+}
+
+/// The contract's names of the intents a model hook can match.
+const MODEL_INTENTS: [&str; 10] = [
+    "user_prompt",
+    "subagent",
+    "tool_results",
+    "thread_summarization",
+    "thread_context_summarization",
+    "create_file",
+    "edit_file",
+    "inline_assist",
+    "terminal_inline_assist",
+    "generate_git_commit_message",
+];
+
+/// The contract's snake_case name of a completion intent.
+fn intent_name(intent: Option<CompletionIntent>) -> Option<&'static str> {
+    Some(match intent? {
+        CompletionIntent::UserPrompt => "user_prompt",
+        CompletionIntent::Subagent => "subagent",
+        CompletionIntent::ToolResults => "tool_results",
+        CompletionIntent::ThreadSummarization => "thread_summarization",
+        CompletionIntent::ThreadContextSummarization => "thread_context_summarization",
+        CompletionIntent::CreateFile => "create_file",
+        CompletionIntent::EditFile => "edit_file",
+        CompletionIntent::InlineAssist => "inline_assist",
+        CompletionIntent::TerminalInlineAssist => "terminal_inline_assist",
+        CompletionIntent::GenerateGitCommitMessage => "generate_git_commit_message",
+    })
+}
+
+fn stop_reason_name(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::ToolUse => "tool_use",
+        StopReason::Refusal => "refusal",
+    }
+}
+
+/// A request message in the contract's provider-neutral shape.
+fn message_to_contract(message: &LanguageModelRequestMessage) -> serde_json::Value {
+    let role = match message.role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+    let content = message
+        .content
+        .iter()
+        .map(|part| match part {
+            MessageContent::Text(text) => json!({ "type": "text", "text": text }),
+            MessageContent::Thinking { text, .. } => json!({ "type": "thinking", "text": text }),
+            MessageContent::RedactedThinking(_) => json!({ "type": "redacted_thinking" }),
+            MessageContent::Image(image) => json!({ "type": "image", "byte_length": image.len() }),
+            MessageContent::ToolUse(tool_use) => {
+                let input = match &tool_use.input {
+                    LanguageModelToolUseInput::Json(input) if input.is_object() => input.clone(),
+                    LanguageModelToolUseInput::Json(input) => json!({ "input": input }),
+                    LanguageModelToolUseInput::Text(input) => json!({ "input": input }),
+                };
+                json!({
+                    "type": "tool_use",
+                    "id": tool_use.id.to_string(),
+                    "name": tool_use.name.to_string(),
+                    "input": input,
+                })
+            }
+            MessageContent::ToolResult(result) => {
+                // Image results are reduced to an empty string.
+                let text = result
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        LanguageModelToolResultContent::Text(text) => Some(text.as_ref()),
+                        LanguageModelToolResultContent::Image(_) => None,
+                    })
+                    .collect::<String>();
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": result.tool_use_id.to_string(),
+                    "tool_name": result.tool_name.to_string(),
+                    "is_error": result.is_error,
+                    "text": text,
+                })
+            }
+            MessageContent::Compaction(CompactedContext::Summary { content, .. }) => {
+                json!({ "type": "text", "text": content.as_ref() })
+            }
+            // Only the provider can read its own compacted state.
+            MessageContent::Compaction(CompactedContext::ProviderState(_)) => {
+                json!({ "type": "text", "text": "[Context compacted by the provider]" })
+            }
+        })
+        .collect::<Vec<_>>();
+    json!({ "role": role, "content": content })
+}
+
+/// The `system_prompt_insert` of a `BeforeModel` output. An empty text, or
+/// one over 10,000 characters, makes the output invalid.
+fn system_prompt_insert(output: &serde_json::Value) -> Result<Option<&str>> {
+    let insert = match output.pointer("/hookSpecificOutput/system_prompt_insert") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(insert) => insert
+            .as_str()
+            .context("`system_prompt_insert` must be a string")?,
+    };
+    anyhow::ensure!(!insert.is_empty(), "`system_prompt_insert` is empty");
+    let length = insert.chars().count();
+    anyhow::ensure!(
+        length <= MAX_SYSTEM_PROMPT_INSERT_CHARS,
+        "`system_prompt_insert` has {length} characters, more than \
+         {MAX_SYSTEM_PROMPT_INSERT_CHARS}"
+    );
+    Ok(Some(insert))
+}
+
+/// The cap Claude Code puts on `additionalContext`: the text is resent with
+/// every request.
+const MAX_SYSTEM_PROMPT_INSERT_CHARS: usize = 10_000;
+
+/// Logs the output fields, given as JSON pointers, that this version of Zed
+/// reads but does not apply yet.
+fn log_unsupported_output_fields(output: &serde_json::Value, pointers: &[&str]) {
+    for pointer in pointers {
+        if output
+            .pointer(pointer)
+            .is_some_and(|value| !value.is_null())
+        {
+            log::info!("agent hook output field `{pointer}` is not supported yet; ignored");
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
 
     use gpui::TestAppContext;
-    use language_model::LanguageModelToolResultContent;
+    use language_model::{LanguageModelImage, LanguageModelToolResult, LanguageModelToolUse};
     use serde_json::json;
     use std::{
         cell::{Cell, RefCell},
@@ -1184,7 +1853,6 @@ mod tests {
                 "PostToolUse": [{
                     "hooks": [{ "type": "command", "command": "bash", "args": ["-c", "true"] }],
                 }],
-                "Stop": [{ "hooks": [{ "type": "command", "command": "ignored" }] }],
             }),
             Path::new("/data/hooks"),
         )
@@ -1282,7 +1950,23 @@ mod tests {
         assert!(created);
     }
 
-    const CONTRACT_SCHEMAS: [(&str, &str); 8] = [
+    const CONTRACT_SCHEMAS: [(&str, &str); 12] = [
+        (
+            "BeforeModel.input.schema.json",
+            include_str!("../hook_contract/BeforeModel.input.schema.json"),
+        ),
+        (
+            "BeforeModel.output.schema.json",
+            include_str!("../hook_contract/BeforeModel.output.schema.json"),
+        ),
+        (
+            "AfterModel.input.schema.json",
+            include_str!("../hook_contract/AfterModel.input.schema.json"),
+        ),
+        (
+            "AfterModel.output.schema.json",
+            include_str!("../hook_contract/AfterModel.output.schema.json"),
+        ),
         (
             "common-input.schema.json",
             include_str!("../hook_contract/common-input.schema.json"),
@@ -1317,7 +2001,7 @@ mod tests {
         ),
     ];
 
-    fn assert_matches_contract(schema_name: &str, value: &serde_json::Value) {
+    pub(crate) fn assert_matches_contract(schema_name: &str, value: &serde_json::Value) {
         if let Some(error) = contract_error(schema_name, value) {
             panic!("{schema_name}: {error}\n{value:#}");
         }
@@ -1894,5 +2578,263 @@ mod tests {
             output.unwrap()["reason"],
             project_dir.file_name().unwrap().to_string_lossy().as_ref()
         );
+    }
+
+    fn message(role: Role, content: Vec<MessageContent>) -> LanguageModelRequestMessage {
+        LanguageModelRequestMessage {
+            role,
+            content,
+            cache: false,
+            reasoning_details: None,
+        }
+    }
+
+    fn text_of(message: &LanguageModelRequestMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                MessageContent::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_insert_into_system_message_before_heading_or_at_end() {
+        let user = message(Role::User, vec!["See ## System Information below.".into()]);
+        let mut request = LanguageModelRequest {
+            messages: vec![
+                message(
+                    Role::System,
+                    vec!["You are Zed.\n\n## System Information\n\nOS: test\n".into()],
+                ),
+                user.clone(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            insert_into_system_message(&mut request, "## Agent Profile\nExplorer."),
+            InsertOutcome::BeforeHeading
+        );
+        assert_eq!(
+            text_of(&request.messages[0]),
+            "You are Zed.\n\n## Agent Profile\nExplorer.\n\n## System Information\n\nOS: test\n"
+        );
+        assert_eq!(request.messages[1], user);
+
+        let mut request = LanguageModelRequest {
+            messages: vec![
+                message(Role::System, vec!["You are Zed.".into()]),
+                user.clone(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            insert_into_system_message(&mut request, "Extra."),
+            InsertOutcome::AtEnd
+        );
+        assert_eq!(text_of(&request.messages[0]), "You are Zed.\n\nExtra.");
+        assert_eq!(request.messages[1], user);
+
+        let mut request = LanguageModelRequest {
+            messages: vec![user.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            insert_into_system_message(&mut request, "Extra."),
+            InsertOutcome::NoSystemMessage
+        );
+        assert_eq!(request.messages, vec![user]);
+    }
+
+    #[test]
+    fn test_system_prompt_insert_skips_compaction() {
+        let conversation = LanguageModelRequest {
+            intent: Some(CompletionIntent::UserPrompt),
+            messages: vec![
+                message(Role::System, vec!["You are Zed.".into()]),
+                message(Role::User, vec!["Hello".into()]),
+            ],
+            ..Default::default()
+        };
+        assert!(applies_system_prompt_insert(&conversation));
+
+        let mut compaction = conversation.clone();
+        compaction.intent = Some(CompletionIntent::ThreadContextSummarization);
+        compaction
+            .messages
+            .push(message(Role::User, vec![COMPACTION_PROMPT.into()]));
+        assert!(!applies_system_prompt_insert(&compaction));
+    }
+
+    #[test]
+    fn test_model_hook_matcher_naming_titles_is_refused() {
+        for matcher in ["thread_summarization", "user_prompt|thread_summarization"] {
+            for event in ["BeforeModel", "AfterModel"] {
+                let error = AgentHooks::from_settings(
+                    &json!({
+                        event: [{ "matcher": matcher, "hooks": [{ "type": "command", "command": "x" }] }],
+                    }),
+                    Path::new("/data/hooks"),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{event} matcher {matcher:?} must be refused"))
+                .to_string();
+                assert!(error.contains(&format!("{event}[0].matcher")), "{error}");
+            }
+        }
+        for universal in ["*", "", ".*", ".+"] {
+            assert!(
+                AgentHooks::from_settings(
+                    &json!({ "BeforeModel": [{ "matcher": universal, "hooks": [{ "type": "command", "command": "x" }] }] }),
+                    Path::new("/data/hooks"),
+                )
+                .is_ok(),
+                "{universal:?} must be accepted"
+            );
+        }
+        assert!(
+            AgentHooks::from_settings(
+                &json!({ "AfterModel": [{ "matcher": "thread_.*", "hooks": [{ "type": "command", "command": "x" }] }] }),
+                Path::new("/data/hooks"),
+            )
+            .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_output_for_another_event_is_a_hook_failure(cx: &mut TestAppContext) {
+        let (deny, _) = fake_hook(Ok(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Wrong event.",
+            }
+        })));
+        let (note, _) = fake_hook(Ok(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": "Wrong event too.",
+            }
+        })));
+        let (tool, echo) = hooked_echo(vec![deny], vec![note]);
+
+        let (is_error, texts) = run_echo(tool, "hello", cx).await;
+
+        assert!(!is_error);
+        assert_eq!(texts, vec!["hello".to_string()]);
+        assert_eq!(echo.runs.get(), 1);
+    }
+
+    #[test]
+    fn test_model_messages_match_contract() {
+        let messages = [
+            message(Role::System, vec!["You are Zed.".into()]),
+            message(
+                Role::Assistant,
+                vec![
+                    MessageContent::Thinking {
+                        text: "Let me look.".into(),
+                        signature: Some("sig".into()),
+                    },
+                    MessageContent::RedactedThinking("opaque".into()),
+                    MessageContent::ToolUse(LanguageModelToolUse {
+                        id: "tool_1".into(),
+                        name: "grep".into(),
+                        raw_input: r#"{"regex":"fn"}"#.into(),
+                        input: LanguageModelToolUseInput::Json(json!({ "regex": "fn" })),
+                        is_input_complete: true,
+                        thought_signature: None,
+                    }),
+                ],
+            ),
+            message(
+                Role::User,
+                vec![
+                    MessageContent::ToolResult(LanguageModelToolResult {
+                        tool_use_id: "tool_1".into(),
+                        tool_name: "grep".into(),
+                        is_error: false,
+                        content: vec!["a".into(), "b".into()],
+                        output: None,
+                    }),
+                    MessageContent::Image(LanguageModelImage {
+                        source: "aGVsbG8=".into(),
+                    }),
+                ],
+            ),
+        ];
+
+        let converted = messages.iter().map(message_to_contract).collect::<Vec<_>>();
+
+        for message in &converted {
+            assert_matches_contract("model-message.schema.json", message);
+        }
+        assert_eq!(
+            converted[1]["content"],
+            json!([
+                { "type": "thinking", "text": "Let me look." },
+                { "type": "redacted_thinking" },
+                { "type": "tool_use", "id": "tool_1", "name": "grep", "input": { "regex": "fn" } },
+            ])
+        );
+        assert_eq!(
+            converted[2]["content"],
+            json!([
+                { "type": "tool_result", "tool_use_id": "tool_1", "tool_name": "grep", "is_error": false, "text": "ab" },
+                { "type": "image", "byte_length": 8 },
+            ])
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_insert_is_validated() {
+        let output = |insert: serde_json::Value| {
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "BeforeModel",
+                    "system_prompt_insert": insert,
+                }
+            })
+        };
+
+        assert_eq!(system_prompt_insert(&json!({})).unwrap(), None);
+        let profile = output(json!("Profile."));
+        assert_eq!(system_prompt_insert(&profile).unwrap(), Some("Profile."));
+        let at_limit = output(json!("é".repeat(10_000)));
+        assert_eq!(
+            system_prompt_insert(&at_limit).unwrap().map(str::len),
+            Some(20_000)
+        );
+        assert!(system_prompt_insert(&output(json!(""))).is_err());
+        assert!(system_prompt_insert(&output(json!("x".repeat(10_001)))).is_err());
+        assert!(system_prompt_insert(&output(json!(42))).is_err());
+    }
+
+    #[test]
+    fn test_model_hooks_are_read_and_other_events_refused() {
+        let check = json!({ "type": "command", "command": "check" });
+        let hooks = AgentHooks::from_settings(
+            &json!({
+                "BeforeModel": [{ "matcher": "user_prompt|tool_results", "hooks": [check.clone()] }],
+                "AfterModel": [{ "hooks": [check.clone()] }],
+            }),
+            Path::new("/data/hooks"),
+        )
+        .unwrap();
+        assert_eq!(matching_hooks(&hooks.before_model, "tool_results").len(), 1);
+        assert_eq!(matching_hooks(&hooks.before_model, "edit_file").len(), 0);
+        assert_eq!(matching_hooks(&hooks.after_model, "user_prompt").len(), 1);
+
+        let error = AgentHooks::from_settings(
+            &json!({ "Stop": [{ "hooks": [check] }] }),
+            Path::new("/data/hooks"),
+        )
+        .err()
+        .expect("events Zed does not run yet must be refused")
+        .to_string();
+        assert!(error.contains("Stop"), "{error}");
     }
 }
