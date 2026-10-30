@@ -259,10 +259,12 @@ fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
             "`args` must be a list of strings"
         );
     }
-    anyhow::ensure!(
-        handler["onFailure"] != "block",
-        "`onFailure: \"block\"` is not supported yet"
-    );
+    if let Some(on_failure) = handler.get("onFailure") {
+        anyhow::ensure!(
+            matches!(on_failure.as_str(), Some("continue" | "block")),
+            "`onFailure` must be \"continue\" or \"block\""
+        );
+    }
     Ok(())
 }
 
@@ -294,6 +296,7 @@ fn matcher_groups_from_settings(
                         shell: handler["shell"].as_str().map(str::to_string),
                         timeout: handler["timeout"].as_u64(),
                         data_dir: data_root.join(hook_data_key(handler).ok()?),
+                        block_on_failure: handler["onFailure"] == "block",
                     }) as Arc<dyn HookHandler>)
                 })
                 .collect(),
@@ -311,6 +314,9 @@ pub struct CommandHook {
     /// Persistent directory the hook keeps its own state in, passed as
     /// `ZED_HOOK_DATA_DIR`. Zed creates it and never reads or deletes it.
     pub data_dir: PathBuf,
+    /// `onFailure: "block"`: a failure acts like exit code 2, so that a slow
+    /// or broken guard cannot let an action through.
+    pub block_on_failure: bool,
 }
 
 impl CommandHook {
@@ -391,46 +397,65 @@ impl HookHandler for CommandHook {
             .unwrap_or_else(|| default_hook_timeout(&hook_event_name));
         let timer = cx.background_executor().timer(timeout);
         let data_dir = self.data_dir.clone();
+        // As in Claude Code, `onFailure` has no effect on Stop and SubagentStop.
+        let block_on_failure =
+            self.block_on_failure && !matches!(hook_event_name.as_str(), "Stop" | "SubagentStop");
         cx.background_executor().spawn(async move {
-            std::fs::create_dir_all(&data_dir)
-                .with_context(|| format!("creating hook data directory {data_dir:?}"))?;
-            // Like Claude Code, hooks run in the project directory, when it is
-            // on this machine (a remote project's is not).
-            if let Some(cwd) = input["cwd"].as_str().map(Path::new)
-                && cwd.is_dir()
-            {
-                command.current_dir(cwd);
-            }
-            let input = serde_json::to_vec(&input)?;
-            let mut child = command.spawn()?;
-            let mut stdin = child.stdin.take().context("hook stdin is not piped")?;
-            let write_input = async move {
-                let written = async {
-                    stdin.write_all(&input).await?;
-                    // Closing flushes: on Windows the pipe is buffered and
-                    // dropping it would lose the input.
-                    stdin.close().await
-                };
-                // A hook may exit without reading its input; its exit code
-                // and outputs decide then, not the closed pipe.
-                if let Err(error) = written.await {
-                    log::debug!("agent hook did not read all its input: {error}");
+            let result: Result<serde_json::Value> = async {
+                std::fs::create_dir_all(&data_dir)
+                    .with_context(|| format!("creating hook data directory {data_dir:?}"))?;
+                // Like Claude Code, hooks run in the project directory, when it is
+                // on this machine (a remote project's is not).
+                if let Some(cwd) = input["cwd"].as_str().map(Path::new)
+                    && cwd.is_dir()
+                {
+                    command.current_dir(cwd);
                 }
-            };
-            // Writing the input and reading the outputs run together under
-            // the timeout, so a hook that reads nothing cannot block the agent.
-            // On timeout, dropping the child kills it.
-            let run = futures::future::join(write_input, child.output());
-            let output = futures::select_biased! {
-                (_, output) = run.fuse() => output?,
-                _ = timer.fuse() => anyhow::bail!("hook timed out after {timeout:?}"),
-            };
-            parse_command_output(
-                &hook_event_name,
-                output.status.code(),
-                &String::from_utf8_lossy(&output.stdout),
-                &String::from_utf8_lossy(&output.stderr),
-            )
+                let input = serde_json::to_vec(&input)?;
+                let mut child = command.spawn()?;
+                let mut stdin = child.stdin.take().context("hook stdin is not piped")?;
+                let write_input = async move {
+                    let written = async {
+                        stdin.write_all(&input).await?;
+                        // Closing flushes: on Windows the pipe is buffered and
+                        // dropping it would lose the input.
+                        stdin.close().await
+                    };
+                    // A hook may exit without reading its input; its exit code
+                    // and outputs decide then, not the closed pipe.
+                    if let Err(error) = written.await {
+                        log::debug!("agent hook did not read all its input: {error}");
+                    }
+                };
+                // Writing the input and reading the outputs run together under
+                // the timeout, so a hook that reads nothing cannot block the agent.
+                // On timeout, dropping the child kills it.
+                let run = futures::future::join(write_input, child.output());
+                let output = futures::select_biased! {
+                    (_, output) = run.fuse() => output?,
+                    _ = timer.fuse() => anyhow::bail!("hook timed out after {timeout:?}"),
+                };
+                let output = parse_command_output(
+                    &hook_event_name,
+                    output.status.code(),
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                )?;
+                // An output for another event is invalid: a failure.
+                check_event_name(&hook_event_name, &output)?;
+                Ok(output)
+            }
+            .await;
+            match result {
+                Err(error) if block_on_failure => {
+                    log::warn!("agent hook {hook_event_name} failed, which blocks: {error:#}");
+                    Ok(blocking_output(
+                        &hook_event_name,
+                        &format!("A hook failed: {error:#}"),
+                    ))
+                }
+                result => result,
+            }
         })
     }
 }
@@ -448,6 +473,21 @@ fn default_hook_timeout(hook_event_name: &str) -> Duration {
         "UserPromptSubmit" => 30,
         _ => DEFAULT_HOOK_TIMEOUT_SECS,
     })
+}
+
+/// What exit code 2 means for an event: a denial for `PreToolUse`, a block
+/// for the others, with `reason`.
+fn blocking_output(hook_event_name: &str, reason: &str) -> serde_json::Value {
+    match hook_event_name {
+        "PreToolUse" => json!({
+            "hookSpecificOutput": {
+                "hookEventName": hook_event_name,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }),
+        _ => json!({ "decision": "block", "reason": reason }),
+    }
 }
 
 /// Turns what a command hook printed into the hook output. Exit code 0 reads
@@ -487,19 +527,7 @@ fn parse_command_output(
                 Ok(json!({}))
             }
         },
-        Some(2) => {
-            let reason = stderr.trim();
-            Ok(match hook_event_name {
-                "PreToolUse" => json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": hook_event_name,
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": reason,
-                    }
-                }),
-                _ => json!({ "decision": "block", "reason": reason }),
-            })
-        }
+        Some(2) => Ok(blocking_output(hook_event_name, stderr.trim())),
         // Any other exit code: a valid JSON object decides and the code is ignored.
         _ => match object {
             Some(Ok(object)) => Ok(object),
@@ -3672,6 +3700,7 @@ pub(crate) mod tests {
             shell: None,
             timeout: Some(30),
             data_dir: std::env::temp_dir().join("zed-agent-hook-tests"),
+            block_on_failure: false,
         }
     }
 
@@ -3683,6 +3712,7 @@ pub(crate) mod tests {
             shell: shell.map(str::to_string),
             timeout: None,
             data_dir: PathBuf::new(),
+            block_on_failure: false,
         };
         let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let default = if cfg!(windows) {
@@ -4336,7 +4366,7 @@ pub(crate) mod tests {
     fn test_unsupported_hook_settings_are_refused_with_their_location() {
         for (settings, location) in [
             (
-                json!({ "PreToolUse": [{ "hooks": [{ "type": "command", "command": "x", "onFailure": "block" }] }] }),
+                json!({ "PreToolUse": [{ "hooks": [{ "type": "command", "command": "x", "onFailure": "sometimes" }] }] }),
                 "PreToolUse[0].hooks[0]",
             ),
             (
@@ -5995,6 +6025,7 @@ pub(crate) mod tests {
             shell: None,
             timeout: Some(30),
             data_dir: data_dir.clone(),
+            block_on_failure: false,
         };
         let root = HookContext {
             session_id: "root-1".into(),
@@ -6165,6 +6196,99 @@ pub(crate) mod tests {
         assert_eq!(
             catalogue_skill_names(&without_catalogue),
             Vec::<String>::new()
+        );
+    }
+    #[test]
+    fn test_on_failure_takes_continue_or_block_only() {
+        let settings = |on_failure: &str| {
+            json!({
+                "PreToolUse": [{
+                    "hooks": [{ "type": "command", "command": "guard", "onFailure": on_failure }],
+                }],
+            })
+        };
+        for value in ["continue", "block"] {
+            assert!(
+                AgentHooks::from_settings(&settings(value), Path::new("/data/hooks")).is_ok(),
+                "{value}"
+            );
+        }
+        let error = AgentHooks::from_settings(&settings("sometimes"), Path::new("/data/hooks"))
+            .err()
+            .expect("an unknown onFailure must be refused")
+            .to_string();
+        assert!(error.contains("PreToolUse[0].hooks[0]"), "{error}");
+    }
+
+    /// Calls the first handler of `event`, declared with `on_failure`.
+    async fn call_failing_hook(
+        event: &str,
+        script: &str,
+        on_failure: &str,
+        cx: &mut TestAppContext,
+    ) -> Result<serde_json::Value> {
+        let hooks = AgentHooks::from_settings(
+            &json!({
+                event: [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "bash",
+                        "args": ["-c", script],
+                        "onFailure": on_failure,
+                    }],
+                }],
+            }),
+            &std::env::temp_dir().join("zed-agent-hook-on-failure"),
+        )?;
+        let groups = match event {
+            "PreToolUse" => &hooks.pre_tool_use,
+            "UserPromptSubmit" => &hooks.user_prompt_submit,
+            "Stop" => &hooks.stop,
+            _ => unreachable!(),
+        };
+        let hook = groups[0].hooks[0].clone();
+        let input = json!({ "hook_event_name": event, "tool_name": "echo" });
+        cx.update(|cx| hook.call(input, cx)).await
+    }
+
+    #[gpui::test]
+    async fn test_on_failure_block_turns_a_failure_into_a_refusal(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        for (failure, script) in [
+            ("exit code", "cat > /dev/null; echo boom >&2; exit 1"),
+            ("invalid JSON", "cat > /dev/null; echo '{not json}'"),
+            (
+                "another event",
+                r#"cat > /dev/null; echo '{"hookSpecificOutput":{"hookEventName":"PostToolUse"}}'"#,
+            ),
+        ] {
+            let output = call_failing_hook("PreToolUse", script, "block", cx)
+                .await
+                .unwrap_or_else(|error| panic!("{failure}: {error:#}"));
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{failure}"
+            );
+            assert_matches_contract("PreToolUse.output.schema.json", &output);
+
+            // Without `block`, a failure stays a failure: the action goes on.
+            assert!(
+                call_failing_hook("PreToolUse", script, "continue", cx)
+                    .await
+                    .is_err(),
+                "{failure}"
+            );
+        }
+
+        let blocked = call_failing_hook("UserPromptSubmit", "exit 1", "block", cx)
+            .await
+            .unwrap();
+        assert_eq!(blocked["decision"], "block");
+        // As in Claude Code, `onFailure` has no effect on Stop.
+        assert!(
+            call_failing_hook("Stop", "exit 1", "block", cx)
+                .await
+                .is_err()
         );
     }
 }
