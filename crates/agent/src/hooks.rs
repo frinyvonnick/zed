@@ -179,7 +179,7 @@ fn check_hook_settings(hooks: &serde_json::Value) -> Result<()> {
             let handlers = group["hooks"].as_array().into_iter().flatten();
             for (handler_ix, handler) in handlers.enumerate() {
                 let location = format!("{event}[{group_ix}].hooks[{handler_ix}]");
-                check_command_handler(handler).with_context(|| format!("hook {location}"))?;
+                check_handler(handler).with_context(|| format!("hook {location}"))?;
                 if handler.get("id").is_none() {
                     continue;
                 }
@@ -222,12 +222,95 @@ const SUPPORTED_EVENTS: [&str; 13] = [
     "SessionEnd",
 ];
 
-fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
+fn check_handler(handler: &serde_json::Value) -> Result<()> {
+    match handler["type"].as_str() {
+        Some("command") => check_command_handler(handler),
+        Some("http") => check_http_handler(handler),
+        _ => anyhow::bail!(
+            "hooks of type {} are not supported yet; only `command` and `http` hooks run",
+            handler["type"]
+        ),
+    }?;
+    if let Some(timeout) = handler.get("timeout") {
+        anyhow::ensure!(
+            timeout.as_u64().is_some_and(|timeout| timeout >= 1),
+            "`timeout` must be a whole number of seconds, at least 1"
+        );
+    }
+    if let Some(on_failure) = handler.get("onFailure") {
+        anyhow::ensure!(
+            matches!(on_failure.as_str(), Some("continue" | "block")),
+            "`onFailure` must be \"continue\" or \"block\""
+        );
+    }
+    if let Some(status_message) = handler.get("statusMessage") {
+        anyhow::ensure!(
+            status_message.is_string(),
+            "`statusMessage` must be a string"
+        );
+    }
+    Ok(())
+}
+
+/// The fields of an `http` hook. It has no `id` and no data directory: its
+/// server keeps its own state.
+const HTTP_HOOK_FIELDS: [&str; 7] = [
+    "type",
+    "url",
+    "headers",
+    "allowedEnvVars",
+    "timeout",
+    "onFailure",
+    "statusMessage",
+];
+
+fn check_http_handler(handler: &serde_json::Value) -> Result<()> {
+    if let Some(field) = handler
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(field, _)| field)
+        .find(|field| !HTTP_HOOK_FIELDS.contains(&field.as_str()))
+    {
+        anyhow::bail!("`{field}` is not a field of an http hook");
+    }
+    let url = handler["url"]
+        .as_str()
+        .context("an http hook needs a `url`")?;
+    let parsed = url::Url::parse(url).with_context(|| format!("invalid `url` {url:?}"))?;
     anyhow::ensure!(
-        handler["type"] == "command",
-        "hooks of type {} are not supported yet; only `command` hooks run",
-        handler["type"]
+        matches!(parsed.scheme(), "http" | "https"),
+        "the `url` of an http hook must be http or https"
     );
+    if let Some(headers) = handler.get("headers") {
+        anyhow::ensure!(
+            headers
+                .as_object()
+                .is_some_and(|headers| headers.values().all(serde_json::Value::is_string)),
+            "`headers` must map names to strings"
+        );
+        for name in headers
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, _)| name)
+        {
+            http_client::http::HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("invalid header name {name:?}"))?;
+        }
+    }
+    if let Some(variables) = handler.get("allowedEnvVars") {
+        anyhow::ensure!(
+            variables
+                .as_array()
+                .is_some_and(|variables| variables.iter().all(serde_json::Value::is_string)),
+            "`allowedEnvVars` must be a list of names"
+        );
+    }
+    Ok(())
+}
+
+fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
     for field in ["if", "async", "once"] {
         anyhow::ensure!(
             handler.get(field).is_none(),
@@ -238,12 +321,6 @@ fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
         anyhow::ensure!(
             matches!(shell.as_str(), Some("bash" | "powershell")),
             "`shell` must be \"bash\" or \"powershell\""
-        );
-    }
-    if let Some(timeout) = handler.get("timeout") {
-        anyhow::ensure!(
-            timeout.as_u64().is_some_and(|timeout| timeout >= 1),
-            "`timeout` must be a whole number of seconds, at least 1"
         );
     }
     anyhow::ensure!(
@@ -257,12 +334,6 @@ fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
             args.as_array()
                 .is_some_and(|args| args.iter().all(serde_json::Value::is_string)),
             "`args` must be a list of strings"
-        );
-    }
-    if let Some(on_failure) = handler.get("onFailure") {
-        anyhow::ensure!(
-            matches!(on_failure.as_str(), Some("continue" | "block")),
-            "`onFailure` must be \"continue\" or \"block\""
         );
     }
     Ok(())
@@ -284,6 +355,11 @@ fn matcher_groups_from_settings(
                 .into_iter()
                 .flatten()
                 .filter_map(|handler| {
+                    if handler["type"] == "http" {
+                        return Some(
+                            Arc::new(HttpHook::from_settings(handler)?) as Arc<dyn HookHandler>
+                        );
+                    }
                     let command = handler["command"].as_str()?.to_string();
                     let args = handler["args"].as_array().map(|args| {
                         args.iter()
@@ -357,7 +433,8 @@ impl HookHandler for CommandHook {
                 &self.args,
                 &self.shell,
                 self.timeout,
-                &self.data_dir
+                &self.data_dir,
+                self.block_on_failure
             )
         ))
     }
@@ -446,19 +523,201 @@ impl HookHandler for CommandHook {
                 Ok(output)
             }
             .await;
-            match result {
-                Err(error) if block_on_failure => {
-                    log::warn!("agent hook {hook_event_name} failed, which blocks: {error:#}");
-                    Ok(blocking_output(
-                        &hook_event_name,
-                        &format!("A hook failed: {error:#}"),
-                    ))
-                }
-                result => result,
-            }
+            settle_hook_result(result, &hook_event_name, block_on_failure)
         })
     }
 }
+
+/// Ends a hook call: with `onFailure: "block"`, a failure acts like exit
+/// code 2 on its event.
+fn settle_hook_result(
+    result: Result<serde_json::Value>,
+    hook_event_name: &str,
+    block_on_failure: bool,
+) -> Result<serde_json::Value> {
+    match result {
+        Err(error) if block_on_failure => {
+            log::warn!("agent hook {hook_event_name} failed, which blocks: {error:#}");
+            Ok(blocking_output(
+                hook_event_name,
+                &format!("A hook failed: {error:#}"),
+            ))
+        }
+        result => result,
+    }
+}
+
+/// POSTs the hook input as JSON to a URL, and reads the output in a 2xx
+/// body, as Claude Code does. A 2xx empty body is a success without fields;
+/// any other answer is a failure. A server that stays up keeps its own
+/// state: no data directory.
+pub struct HttpHook {
+    pub url: String,
+    /// Extra headers, their allowed `$VAR` already replaced.
+    pub headers: Vec<(String, String)>,
+    pub timeout: Option<u64>,
+    pub block_on_failure: bool,
+}
+
+impl HttpHook {
+    fn from_settings(handler: &serde_json::Value) -> Option<Self> {
+        let allowed = handler["allowedEnvVars"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        let headers = handler["headers"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, value)| {
+                let value =
+                    interpolate_header(value.as_str()?, &allowed, |name| std::env::var(name).ok());
+                Some((name.clone(), value))
+            })
+            .collect();
+        Some(Self {
+            url: handler["url"].as_str()?.to_string(),
+            headers,
+            timeout: handler["timeout"].as_u64(),
+            block_on_failure: handler["onFailure"] == "block",
+        })
+    }
+}
+
+impl HookHandler for HttpHook {
+    fn dedup_key(&self) -> Option<String> {
+        Some(format!(
+            "{:?}",
+            (
+                &self.url,
+                &self.headers,
+                self.timeout,
+                self.block_on_failure
+            )
+        ))
+    }
+
+    fn call(&self, input: serde_json::Value, cx: &mut App) -> Task<Result<serde_json::Value>> {
+        let hook_event_name = input["hook_event_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let timeout = self
+            .timeout
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| default_hook_timeout(&hook_event_name));
+        let timer = cx.background_executor().timer(timeout);
+        // As in Claude Code, `onFailure` has no effect on Stop and SubagentStop.
+        let block_on_failure =
+            self.block_on_failure && !matches!(hook_event_name.as_str(), "Stop" | "SubagentStop");
+        let client = cx.http_client();
+        // A redirect would send the conversation, and the headers, to
+        // another host: a 3xx is a failure.
+        let mut request = http_client::HttpRequestExt::follow_redirects(
+            http_client::Request::builder(),
+            http_client::RedirectPolicy::NoFollow,
+        )
+        .method(http_client::Method::POST)
+        .uri(self.url.as_str())
+        .header("Content-Type", "application/json");
+        for (name, value) in &self.headers {
+            // A header of the user replaces Zed's, such as `Content-Type`.
+            if let Some(headers) = request.headers_mut()
+                && let (Ok(name), Ok(value)) = (
+                    http_client::http::HeaderName::from_bytes(name.as_bytes()),
+                    http_client::http::HeaderValue::from_str(value),
+                )
+            {
+                headers.insert(name, value);
+            } else {
+                log::warn!("an http hook header cannot be sent; it is left out");
+            }
+        }
+        cx.background_executor().spawn(async move {
+            let result: Result<serde_json::Value> = async {
+                let request =
+                    request.body(http_client::AsyncBody::from(serde_json::to_vec(&input)?))?;
+                // The timeout covers the whole exchange, body included: a
+                // server that never ends its body cannot hold the agent.
+                let exchange = async {
+                    let mut response = client.send(request).await?;
+                    anyhow::ensure!(
+                        response.status().is_success(),
+                        "hook answered HTTP {}",
+                        response.status()
+                    );
+                    let mut body = Vec::new();
+                    futures::AsyncReadExt::read_to_end(
+                        &mut futures::AsyncReadExt::take(
+                            response.body_mut(),
+                            MAX_HTTP_HOOK_BODY_BYTES as u64 + 1,
+                        ),
+                        &mut body,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        body.len() <= MAX_HTTP_HOOK_BODY_BYTES,
+                        "hook answered more than {MAX_HTTP_HOOK_BODY_BYTES} bytes"
+                    );
+                    Ok(String::from_utf8(body)?)
+                };
+                let body = futures::select_biased! {
+                    body = exchange.fuse() => body?,
+                    _ = timer.fuse() => anyhow::bail!("hook timed out after {timeout:?}"),
+                };
+                let body = body.trim();
+                let output = if body.is_empty() {
+                    json!({})
+                } else {
+                    let output = serde_json::from_str::<serde_json::Value>(body)
+                        .context("hook answered invalid JSON")?;
+                    anyhow::ensure!(
+                        output.is_object(),
+                        "hook answered JSON that is not an object"
+                    );
+                    output
+                };
+                // An output for another event is invalid: a failure.
+                check_event_name(&hook_event_name, &output)?;
+                Ok(output)
+            }
+            .await;
+            settle_hook_result(result, &hook_event_name, block_on_failure)
+        })
+    }
+}
+
+/// Replaces `$VAR` and `${VAR}` in a header value, as Claude Code does:
+/// a variable listed in `allowedEnvVars` takes its value, any other one
+/// becomes empty, so that a header cannot leak what the user did not allow.
+fn interpolate_header(
+    value: &str,
+    allowed: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> String {
+    static VARIABLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+            .expect("valid variable pattern")
+    });
+    VARIABLE
+        .replace_all(value, |variable: &regex::Captures| {
+            let name = variable
+                .get(1)
+                .or(variable.get(2))
+                .map_or("", |name| name.as_str());
+            if allowed.iter().any(|allowed| allowed == name) {
+                lookup(name).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        })
+        .into_owned()
+}
+
+/// The largest body an http hook may answer.
+const MAX_HTTP_HOOK_BODY_BYTES: usize = 1 << 20;
 
 /// Environment variable holding the hook's own data directory.
 const HOOK_DATA_DIR_VAR: &str = "ZED_HOOK_DATA_DIR";
@@ -4384,7 +4643,7 @@ pub(crate) mod tests {
         ]
         .into_iter()
         .chain(
-            ["http", "mcp_tool", "prompt", "agent"].map(|kind| {
+            ["mcp_tool", "prompt", "agent"].map(|kind| {
                 (
                     json!({ "PreToolUse": [{ "hooks": [{ "type": kind, "url": "http://localhost:9000" }] }] }),
                     "PreToolUse[0].hooks[0]",
@@ -6290,5 +6549,416 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[test]
+    fn test_http_hook_settings_are_checked() {
+        let http = |handler: serde_json::Value| {
+            AgentHooks::from_settings(
+                &json!({ "PreToolUse": [{ "hooks": [handler] }] }),
+                Path::new("/data/hooks"),
+            )
+        };
+        let hooks = http(json!({
+            "type": "http",
+            "url": "http://localhost:8787/hooks",
+            "headers": { "Authorization": "Bearer $TOKEN" },
+            "allowedEnvVars": ["TOKEN"],
+            "timeout": 5,
+            "onFailure": "block",
+        }))
+        .unwrap();
+        assert_eq!(hooks.pre_tool_use[0].hooks.len(), 1);
+
+        for (handler, reason) in [
+            (json!({ "type": "http" }), "url"),
+            (json!({ "type": "http", "url": "not a url" }), "url"),
+            (
+                json!({ "type": "http", "url": "http://x", "id": "guard" }),
+                "id",
+            ),
+            (
+                json!({ "type": "http", "url": "http://x", "command": "guard" }),
+                "command",
+            ),
+            (
+                json!({ "type": "http", "url": "http://x", "headers": { "A": 1 } }),
+                "headers",
+            ),
+            (
+                json!({ "type": "http", "url": "http://x", "allowedEnvVars": "TOKEN" }),
+                "allowedEnvVars",
+            ),
+        ] {
+            let error = http(handler.clone())
+                .err()
+                .unwrap_or_else(|| panic!("must be refused: {handler}"));
+            let error = format!("{error:#}");
+            assert!(error.contains("PreToolUse[0].hooks[0]"), "{error}");
+            assert!(error.contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_http_header_values_take_allowed_variables_only() {
+        let lookup = |name: &str| match name {
+            "TOKEN" => Some("secret".to_string()),
+            "OTHER" => Some("leak".to_string()),
+            _ => None,
+        };
+        let allowed = vec!["TOKEN".to_string(), "MISSING".to_string()];
+        assert_eq!(
+            interpolate_header("Bearer $TOKEN", &allowed, lookup),
+            "Bearer secret"
+        );
+        assert_eq!(
+            interpolate_header("x-${TOKEN}-y", &allowed, lookup),
+            "x-secret-y"
+        );
+        assert_eq!(
+            interpolate_header("$OTHER|$MISSING|", &allowed, lookup),
+            "||"
+        );
+        assert_eq!(
+            interpolate_header("no variable", &allowed, lookup),
+            "no variable"
+        );
+    }
+
+    /// An HTTP hook from settings whose server answers `status` and `body`;
+    /// returns the hook output and the requests the server got.
+    async fn call_http_hook(
+        event: &str,
+        status: u16,
+        body: &'static str,
+        on_failure: &str,
+        cx: &mut TestAppContext,
+    ) -> (
+        Result<serde_json::Value>,
+        Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>,
+    ) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = gpui::http_client::FakeHttpClient::create({
+            let requests = requests.clone();
+            move |request| {
+                let requests = requests.clone();
+                async move {
+                    let header = |name: &str| {
+                        request
+                            .headers()
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    let (content_type, authorization) =
+                        (header("content-type"), header("authorization"));
+                    let method = request.method().to_string();
+                    let mut sent = String::new();
+                    let mut request_body = request.into_body();
+                    futures::AsyncReadExt::read_to_string(&mut request_body, &mut sent).await?;
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((method, content_type, authorization, sent));
+                    Ok(gpui::http_client::Response::builder()
+                        .status(status)
+                        .body(body.into())
+                        .unwrap())
+                }
+            }
+        });
+        cx.update(|cx| cx.set_http_client(client));
+        let hooks = AgentHooks::from_settings(
+            &json!({
+                event: [{
+                    "hooks": [{
+                        "type": "http",
+                        "url": "http://localhost:8787/hooks",
+                        "headers": { "Authorization": "Bearer $ZED_TEST_ABSENT_TOKEN" },
+                        "allowedEnvVars": ["ZED_TEST_ABSENT_TOKEN"],
+                        "onFailure": on_failure,
+                    }],
+                }],
+            }),
+            Path::new("/data/hooks"),
+        )
+        .unwrap();
+        let hook = match event {
+            "PreToolUse" => hooks.pre_tool_use[0].hooks[0].clone(),
+            "Stop" => hooks.stop[0].hooks[0].clone(),
+            _ => unreachable!(),
+        };
+        let input = json!({ "hook_event_name": event, "tool_name": "echo" });
+        let output = cx.update(|cx| hook.call(input, cx)).await;
+        (output, requests)
+    }
+
+    #[gpui::test]
+    async fn test_http_hooks_post_the_input_and_read_a_2xx_body(cx: &mut TestAppContext) {
+        let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"No."}}"#;
+        let (output, requests) = call_http_hook("PreToolUse", 200, deny, "continue", cx).await;
+        assert_eq!(
+            output.unwrap()["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
+        let requests = requests.lock().unwrap();
+        let (method, content_type, authorization, sent) = &requests[0];
+        assert_eq!(method, "POST");
+        assert_eq!(content_type, "application/json");
+        // An allowed variable that is not set becomes empty.
+        assert_eq!(authorization, "Bearer ");
+        let sent: serde_json::Value = serde_json::from_str(sent).unwrap();
+        assert_eq!(sent["hook_event_name"], "PreToolUse");
+
+        // An empty 2xx body is a success without fields.
+        let (output, _) = call_http_hook("PreToolUse", 204, "", "continue", cx).await;
+        assert_eq!(output.unwrap(), json!({}));
+
+        // A status outside 2xx, a body that is not an object, or an output
+        // for another event fail; the action goes on.
+        let other_event = r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse"}}"#;
+        for (status, body) in [
+            (500, deny),
+            (200, "[1]"),
+            (200, "not json"),
+            (200, other_event),
+        ] {
+            let (output, _) = call_http_hook("PreToolUse", status, body, "continue", cx).await;
+            assert!(output.is_err(), "{status} {body}");
+        }
+
+        // With `block`, a failure refuses, as exit code 2 would; not on Stop.
+        let (output, _) = call_http_hook("PreToolUse", 503, "", "block", cx).await;
+        let output = output.unwrap();
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_matches_contract("PreToolUse.output.schema.json", &output);
+        let (output, _) = call_http_hook("Stop", 503, "", "block", cx).await;
+        assert!(output.is_err());
+    }
+    /// The first hook of `event` declared by the http `handler`, served by
+    /// a fake client that answers each request with `respond`.
+    fn http_hook_with(
+        event: &str,
+        handler: serde_json::Value,
+        respond: impl Fn(
+            gpui::http_client::Request<http_client::AsyncBody>,
+        ) -> gpui::http_client::Response<http_client::AsyncBody>
+        + Send
+        + Sync
+        + 'static,
+        cx: &mut TestAppContext,
+    ) -> Arc<dyn HookHandler> {
+        let respond = Arc::new(respond);
+        let client = gpui::http_client::FakeHttpClient::create(move |request| {
+            let response = respond(request);
+            async move { Ok(response) }
+        });
+        cx.update(|cx| cx.set_http_client(client));
+        let hooks = AgentHooks::from_settings(
+            &json!({ event: [{ "hooks": [handler] }] }),
+            Path::new("/data/hooks"),
+        )
+        .unwrap();
+        match event {
+            "PreToolUse" => hooks.pre_tool_use[0].hooks[0].clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn respond_with(
+        status: u16,
+        body: http_client::AsyncBody,
+    ) -> gpui::http_client::Response<http_client::AsyncBody> {
+        gpui::http_client::Response::builder()
+            .status(status)
+            .body(body)
+            .unwrap()
+    }
+
+    /// A body that never ends.
+    struct EndlessBody;
+
+    impl futures::AsyncRead for EndlessBody {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[gpui::test]
+    async fn test_http_hook_timeout_covers_the_body(cx: &mut TestAppContext) {
+        for on_failure in ["continue", "block"] {
+            let hook = http_hook_with(
+                "PreToolUse",
+                json!({
+                    "type": "http",
+                    "url": "http://localhost:8787/hooks",
+                    "timeout": 1,
+                    "onFailure": on_failure,
+                }),
+                |_| respond_with(200, http_client::AsyncBody::from_reader(EndlessBody)),
+                cx,
+            );
+            let input = json!({ "hook_event_name": "PreToolUse", "tool_name": "echo" });
+            let task = cx.update(|cx| hook.call(input, cx));
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_secs(2));
+            let output = task.await;
+            match on_failure {
+                "continue" => assert!(output.is_err(), "{output:?}"),
+                _ => assert_eq!(
+                    output.unwrap()["hookSpecificOutput"]["permissionDecision"],
+                    "deny"
+                ),
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_http_hook_follows_no_redirect(cx: &mut TestAppContext) {
+        let policies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = http_hook_with(
+            "PreToolUse",
+            json!({ "type": "http", "url": "http://localhost:8787/hooks" }),
+            {
+                let policies = policies.clone();
+                move |request| {
+                    policies.lock().unwrap().push(
+                        request
+                            .extensions()
+                            .get::<http_client::RedirectPolicy>()
+                            .cloned(),
+                    );
+                    gpui::http_client::Response::builder()
+                        .status(307)
+                        .header("location", "http://elsewhere.example/steal")
+                        .body(http_client::AsyncBody::empty())
+                        .unwrap()
+                }
+            },
+            cx,
+        );
+        let input = json!({ "hook_event_name": "PreToolUse", "tool_name": "echo" });
+        assert!(cx.update(|cx| hook.call(input, cx)).await.is_err());
+        assert_eq!(
+            *policies.lock().unwrap(),
+            vec![Some(http_client::RedirectPolicy::NoFollow)]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_http_hook_body_is_capped_and_blank_is_empty(cx: &mut TestAppContext) {
+        let input = json!({ "hook_event_name": "PreToolUse", "tool_name": "echo" });
+        let too_long = format!(
+            "{{\"padding\":\"{}\"}}",
+            "x".repeat(MAX_HTTP_HOOK_BODY_BYTES)
+        );
+        let hook = http_hook_with(
+            "PreToolUse",
+            json!({ "type": "http", "url": "http://localhost:8787/hooks" }),
+            move |_| respond_with(200, too_long.clone().into()),
+            cx,
+        );
+        assert!(cx.update(|cx| hook.call(input.clone(), cx)).await.is_err());
+
+        let hook = http_hook_with(
+            "PreToolUse",
+            json!({ "type": "http", "url": "http://localhost:8787/hooks" }),
+            |_| respond_with(200, " \n\t ".into()),
+            cx,
+        );
+        assert_eq!(
+            cx.update(|cx| hook.call(input, cx)).await.unwrap(),
+            json!({})
+        );
+    }
+
+    #[gpui::test]
+    async fn test_http_hook_content_type_can_be_replaced(cx: &mut TestAppContext) {
+        let content_types = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = http_hook_with(
+            "PreToolUse",
+            json!({
+                "type": "http",
+                "url": "http://localhost:8787/hooks",
+                "headers": { "content-type": "application/vnd.api+json" },
+            }),
+            {
+                let content_types = content_types.clone();
+                move |request| {
+                    content_types.lock().unwrap().extend(
+                        request
+                            .headers()
+                            .get_all("content-type")
+                            .iter()
+                            .map(|value| value.to_str().unwrap().to_string()),
+                    );
+                    respond_with(204, http_client::AsyncBody::empty())
+                }
+            },
+            cx,
+        );
+        let input = json!({ "hook_event_name": "PreToolUse", "tool_name": "echo" });
+        cx.update(|cx| hook.call(input, cx)).await.unwrap();
+        assert_eq!(
+            *content_types.lock().unwrap(),
+            vec!["application/vnd.api+json".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_hook_settings_check_status_messages_and_header_names() {
+        let refused = |handler: serde_json::Value| {
+            format!(
+                "{:#}",
+                AgentHooks::from_settings(
+                    &json!({ "PreToolUse": [{ "hooks": [handler.clone()] }] }),
+                    Path::new("/data/hooks"),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("must be refused: {handler}"))
+            )
+        };
+        for handler in [
+            json!({ "type": "http", "url": "http://x", "statusMessage": 42 }),
+            json!({ "type": "command", "command": "guard", "statusMessage": ["a"] }),
+        ] {
+            assert!(refused(handler).contains("statusMessage"));
+        }
+        let error =
+            refused(json!({ "type": "http", "url": "http://x", "headers": { "bad name": "x" } }));
+        assert!(error.contains("bad name"), "{error}");
+        // An unknown field is named, and only it.
+        let error = refused(json!({ "type": "http", "url": "http://x", "command": "guard" }));
+        assert!(error.contains("`command`"), "{error}");
+        assert!(!error.contains("data directory"), "{error}");
+    }
+
+    #[test]
+    fn test_hooks_differing_by_on_failure_both_run() {
+        for handler in [
+            json!({ "type": "command", "command": "guard" }),
+            json!({ "type": "http", "url": "http://x" }),
+        ] {
+            let mut blocking = handler.clone();
+            blocking["onFailure"] = json!("block");
+            let hooks = AgentHooks::from_settings(
+                &json!({ "PreToolUse": [{ "hooks": [handler] }, { "hooks": [blocking] }] }),
+                Path::new("/data/hooks"),
+            )
+            .unwrap();
+            assert_eq!(matching_hooks(&hooks.pre_tool_use, "echo").len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_http_header_variables_do_not_nest() {
+        let lookup = |name: &str| (name == "TOKEN").then(|| "secret".to_string());
+        let allowed = vec!["TOKEN".to_string()];
+        assert_eq!(interpolate_header("${A${OTHER}}", &allowed, lookup), "${A}");
+        assert_eq!(interpolate_header("$$TOKEN", &allowed, lookup), "$secret");
     }
 }

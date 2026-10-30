@@ -2966,6 +2966,62 @@ async fn test_agent_profiles_hook_keeps_an_explorer_read_only(cx: &mut TestAppCo
     std::fs::remove_dir_all(&data_root).ok();
 }
 
+#[gpui::test]
+async fn test_http_hook_from_settings_denies_tool_call(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let client = gpui::http_client::FakeHttpClient::create(|_request| async move {
+        Ok(gpui::http_client::Response::builder()
+            .status(200)
+            .body(
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "Echo is off.",
+                    }
+                })
+                .to_string()
+                .into(),
+            )
+            .unwrap())
+    });
+    cx.update(|cx| {
+        cx.set_http_client(client);
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.agent.get_or_insert_default().hooks = Some(json!({
+                    "PreToolUse": [{
+                        "matcher": "echo",
+                        "hooks": [{ "type": "http", "url": "http://localhost:8787/hooks" }],
+                    }],
+                }));
+            });
+        });
+    });
+    let runs = Arc::new(AtomicUsize::new(0));
+    thread.update(cx, |thread, _| {
+        thread.add_tool(CountingEchoTool(runs.clone()))
+    });
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    send_echo_tool_use(&fake, &model);
+    cx.run_until_parked();
+
+    let tool_result = last_tool_result(&fake);
+    assert!(tool_result.is_error);
+    assert_eq!(tool_result.content, vec!["Echo is off.".into()]);
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+}
+
 /// A hook that answers with the next of its responses, then `{}`.
 struct SequenceHook {
     responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
