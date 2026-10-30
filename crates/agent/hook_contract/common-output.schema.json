@@ -21,7 +21,7 @@
     },
     "systemMessage": {
       "type": "string",
-      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1071). Warning shown to the user in the agent panel."
+      "description": "Claude Code field (sources/claude-code-2026-10-30.md:1071). Warning shown to the user as a Zed notification (one per event, cut at 2000 characters), only when the output is accepted; never sent to the model."
     },
     "terminalSequence": {
       "type": "string",

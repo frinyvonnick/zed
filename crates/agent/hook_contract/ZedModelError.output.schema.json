@@ -9,7 +9,7 @@
   "properties": {
     "systemMessage": {
       "type": "string",
-      "description": "Warning shown to the user in the agent panel."
+      "description": "Warning shown to the user as a Zed notification (one per event, cut at 2000 characters), only when the output is accepted; never sent to the model."
     },
     "hookSpecificOutput": {
       "type": "object",
