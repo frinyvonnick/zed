@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/ZedModelError.input.schema.json",
+  "title": "ZedModelError input",
+  "description": "Zed extension. Fires when a provider rejects a model request (Zed ProviderRejection), before Zed handles the error.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "common-input.schema.json"
+    }
+  ],
+  "required": [
+    "hook_event_name",
+    "request_id",
+    "intent",
+    "model",
+    "provider_error"
+  ],
+  "properties": {
+    "hook_event_name": {
+      "type": "string",
+      "description": "Always this event.",
+      "const": "ZedModelError"
+    },
+    "request_id": {
+      "type": "string",
+      "description": "Identifier of the model request, shared by BeforeModel, AfterModel and ZedModelError.",
+      "format": "uuid"
+    },
+    "intent": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Zed CompletionIntent of the request, snake_case; null when Zed sets none.",
+      "enum": [
+        "user_prompt",
+        "subagent",
+        "tool_results",
+        "thread_summarization",
+        "thread_context_summarization",
+        "create_file",
+        "edit_file",
+        "inline_assist",
+        "terminal_inline_assist",
+        "generate_git_commit_message",
+        null
+      ]
+    },
+    "model": {
+      "type": "object",
+      "$ref": "model-message.schema.json#/$defs/Model",
+      "description": "Model of the request."
+    },
+    "provider_error": {
+      "type": "object",
+      "description": "Zed extension. The rejection as received.",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "code",
+        "message",
+        "zed_category",
+        "retry_after_ms"
+      ],
+      "properties": {
+        "status": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "HTTP status, null if none.",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Provider error code, verbatim."
+        },
+        "message": {
+          "type": "string",
+          "description": "Provider error message, verbatim."
+        },
+        "zed_category": {
+          "type": "string",
+          "description": "How Zed classified it (ProviderErrorCategory, snake_case).",
+          "enum": [
+            "prompt_too_large",
+            "invalid_encrypted_content",
+            "authentication",
+            "permission",
+            "content_policy",
+            "endpoint_not_found",
+            "payment_required",
+            "rate_limit",
+            "overloaded",
+            "invalid_request",
+            "conflict",
+            "timeout",
+            "internal_server",
+            "other"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Retry delay requested by the provider.",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "unevaluatedProperties": false
+}

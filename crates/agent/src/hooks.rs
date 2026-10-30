@@ -6,14 +6,17 @@ use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::{AgentSettings, COMPACTION_PROMPT};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
-use futures::{AsyncWriteExt as _, FutureExt as _, StreamExt as _, channel::oneshot};
+use futures::{
+    AsyncWriteExt as _, FutureExt as _, StreamExt as _,
+    channel::{mpsc, oneshot},
+};
 use gpui::{App, AsyncApp, Entity, Global, SharedString, Task, WeakEntity};
 use language_model::{
     CompactedContext, CompletionIntent, LanguageModel, LanguageModelCompletionError,
     LanguageModelCompletionEvent, LanguageModelCompletionStream, LanguageModelProvider,
     LanguageModelProviderId, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelToolResultContent, LanguageModelToolUseInput, MessageContent, Role, StopReason,
-    TokenUsage,
+    LanguageModelToolResultContent, LanguageModelToolUseInput, MessageContent,
+    ProviderErrorCategory, Role, StopReason, TokenUsage,
 };
 use regex::Regex;
 use serde_json::json;
@@ -63,6 +66,7 @@ pub struct AgentHooks {
     pub after_model: Vec<HookMatcherGroup>,
     pub pre_compact: Vec<HookMatcherGroup>,
     pub post_compact: Vec<HookMatcherGroup>,
+    pub zed_model_error: Vec<HookMatcherGroup>,
 }
 
 impl Global for AgentHooks {}
@@ -88,6 +92,7 @@ impl AgentHooks {
             after_model: matcher_groups_from_settings(&hooks["AfterModel"], data_root),
             pre_compact: matcher_groups_from_settings(&hooks["PreCompact"], data_root),
             post_compact: matcher_groups_from_settings(&hooks["PostCompact"], data_root),
+            zed_model_error: matcher_groups_from_settings(&hooks["ZedModelError"], data_root),
         })
     }
 }
@@ -185,13 +190,14 @@ fn check_hook_settings(hooks: &serde_json::Value) -> Result<()> {
 }
 
 /// The events this version of Zed runs hooks for.
-const SUPPORTED_EVENTS: [&str; 6] = [
+const SUPPORTED_EVENTS: [&str; 7] = [
     "PreToolUse",
     "PostToolUse",
     "BeforeModel",
     "AfterModel",
     "PreCompact",
     "PostCompact",
+    "ZedModelError",
 ];
 
 fn check_command_handler(handler: &serde_json::Value) -> Result<()> {
@@ -1029,6 +1035,7 @@ struct ModelHooks {
     compaction_trigger: Option<CompactionTrigger>,
     pre_compact: Vec<Arc<dyn HookHandler>>,
     post_compact: Vec<Arc<dyn HookHandler>>,
+    zed_model_error: Vec<Arc<dyn HookHandler>>,
 }
 
 impl ModelHooks {
@@ -1040,7 +1047,7 @@ impl ModelHooks {
     ) -> Option<Self> {
         let intent = intent_name(request.intent).unwrap_or_default();
         let compaction_trigger = compaction_trigger.filter(|_| is_compaction_request(request));
-        let (before_model, after_model, pre_compact, post_compact) =
+        let (before_model, after_model, pre_compact, post_compact, zed_model_error) =
             with_configured_hooks(cx, |hooks| {
                 let compaction_hooks = |groups: &[HookMatcherGroup]| {
                     compaction_trigger
@@ -1052,12 +1059,14 @@ impl ModelHooks {
                     matching_hooks(&hooks.after_model, intent),
                     compaction_hooks(&hooks.pre_compact),
                     compaction_hooks(&hooks.post_compact),
+                    matching_hooks(&hooks.zed_model_error, intent),
                 )
             })?;
         if before_model.is_empty()
             && after_model.is_empty()
             && pre_compact.is_empty()
             && post_compact.is_empty()
+            && zed_model_error.is_empty()
         {
             return None;
         }
@@ -1073,6 +1082,7 @@ impl ModelHooks {
             compaction_trigger,
             pre_compact,
             post_compact,
+            zed_model_error,
         })
     }
 
@@ -1098,6 +1108,7 @@ impl ModelHooks {
             },
             "is_compaction": is_compaction_request(&request),
         });
+        let error_cancellation = cancellation.clone();
         if !self.before_model.is_empty() {
             let cancelled = {
                 let before_model = self.run_before_model(&request_fields, model, &mut request, cx);
@@ -1116,7 +1127,23 @@ impl ModelHooks {
         }
 
         let started_at = Instant::now();
-        let mut stream = provider.stream_completion(model, request, cx).await?;
+        let error_hooks = (!self.zed_model_error.is_empty()).then(|| ErrorHooks {
+            context: self.context.clone(),
+            hooks: self.zed_model_error.clone(),
+            request_fields: request_fields.clone(),
+        });
+        let mut stream = match provider.stream_completion(model, request, cx).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Err(match &error_hooks {
+                    Some(error_hooks) => error_hooks.translate(error, error_cancellation, cx).await,
+                    None => error,
+                });
+            }
+        };
+        if let Some(error_hooks) = error_hooks {
+            stream = translate_stream_errors(stream, error_hooks, cx);
+        }
         if let Some(trigger) = self.compaction_trigger
             && !self.post_compact.is_empty()
         {
@@ -1132,6 +1159,7 @@ impl ModelHooks {
             return Ok(stream);
         }
         let (end_tx, end_rx) = oneshot::channel();
+        let (mut usage_tx, usage_rx) = oneshot::channel();
         cx.spawn(async move |cx| {
             // The sender is dropped when the stream fails or is abandoned:
             // AfterModel only observes generations that end normally.
@@ -1139,11 +1167,20 @@ impl ModelHooks {
                 log::info!("AfterModel hooks skipped: the response stream did not end normally");
                 return;
             };
-            self.run_after_model(request_fields, end, started_at, cx)
-                .await;
+            // Closing the stream, for example on Stop, abandons the hooks.
+            let usage = {
+                let run = self.run_after_model(request_fields, end, started_at, cx);
+                let abandoned = usage_tx.cancellation();
+                futures::pin_mut!(run, abandoned);
+                match futures::future::select(run, abandoned).await {
+                    futures::future::Either::Left((usage, _)) => usage,
+                    futures::future::Either::Right(_) => return,
+                }
+            };
+            usage_tx.send(usage).ok();
         })
         .detach();
-        Ok(observe_response_end(stream, end_tx))
+        Ok(observe_response_end(stream, end_tx, usage_rx))
     }
 
     /// Runs the `PreCompact` hooks in declaration order and appends their
@@ -1205,20 +1242,10 @@ impl ModelHooks {
         request: &mut LanguageModelRequest,
         cx: &AsyncApp,
     ) {
-        let messages = request
-            .messages
-            .iter()
-            .map(message_to_contract)
-            .collect::<Vec<_>>();
         // Only the conversation counts: the system message changes with the
-        // model, the date or the tools.
-        let conversation = messages
-            .iter()
-            .zip(&request.messages)
-            .filter(|(_, message)| message.role != Role::System)
-            .map(|(contract, _)| contract)
-            .collect::<Vec<_>>();
-        let conversation_hashes = conversation
+        // model, the date or the tools. What the hooks already took is
+        // remembered as the conversation Zed holds, before any replacement.
+        let conversation_hashes = conversation_messages(request)
             .iter()
             .map(|message| {
                 let mut hasher = DefaultHasher::new();
@@ -1234,11 +1261,7 @@ impl ModelHooks {
         tool_names.sort_unstable();
         let mut event_fields = request_fields.clone();
         if let Some(fields) = event_fields.as_object_mut() {
-            fields.insert("total_message_count".into(), json!(messages.len()));
-            fields.insert(
-                "max_output_tokens".into(),
-                json!(request.effective_max_output_tokens(model.max_output_tokens())),
-            );
+            fields.insert("total_message_count".into(), json!(request.messages.len()));
             fields.insert("tool_names".into(), json!(tool_names));
         }
 
@@ -1252,10 +1275,17 @@ impl ModelHooks {
             // Each hook gets the messages added since its own previous answer.
             let sent_key = (self.context.thread_id.clone(), hook_identity(hook));
             let known = cx.update(|cx| known_message_count(&sent_key, &conversation_hashes, cx));
+            // The chain: each hook gets the replacements and the output reserve
+            // of the previous ones.
+            let conversation = conversation_messages(request);
             let mut hook_fields = event_fields.clone();
             if let Some(fields) = hook_fields.as_object_mut() {
                 fields.insert("new_messages".into(), json!(conversation[known..]));
                 fields.insert("known_message_count".into(), json!(known));
+                fields.insert(
+                    "max_output_tokens".into(),
+                    json!(request.effective_max_output_tokens(model.max_output_tokens())),
+                );
             }
             let input = self.context.input("BeforeModel", hook_fields);
             let output = match cx.update(|cx| hook.call(input, cx)).await {
@@ -1265,15 +1295,21 @@ impl ModelHooks {
                     continue;
                 }
             };
-            let (insert, hook_reminders) = match check_model_hook_output("BeforeModel", &output)
-                .and_then(|()| Ok((system_prompt_insert(&output)?, ephemeral_messages(&output)?)))
-            {
-                Ok(fields) => fields,
-                Err(error) => {
-                    log::warn!("BeforeModel hook output ignored: {error:#}");
-                    continue;
-                }
-            };
+            let (insert, hook_reminders, replacements, max_output_tokens) =
+                match check_model_hook_output("BeforeModel", &output).and_then(|()| {
+                    Ok((
+                        system_prompt_insert(&output)?,
+                        ephemeral_messages(&output)?,
+                        tool_result_replacements(&output, request)?,
+                        hook_max_output_tokens(&output)?,
+                    ))
+                }) {
+                    Ok(fields) => fields,
+                    Err(error) => {
+                        log::warn!("BeforeModel hook output ignored: {error:#}");
+                        continue;
+                    }
+                };
             // The hook took these messages: the next request sends it only the
             // ones that follow. After a failure, they are sent again.
             cx.update(|cx| {
@@ -1281,14 +1317,15 @@ impl ModelHooks {
                     .by_hook
                     .insert(sent_key, conversation_hashes.clone());
             });
-            log_unsupported_output_fields(
-                &output,
-                &[
-                    "/systemMessage",
-                    "/hookSpecificOutput/max_output_tokens",
-                    "/hookSpecificOutput/tool_result_replacements",
-                ],
-            );
+            log_unsupported_output_fields(&output, &["/systemMessage"]);
+            replace_tool_results(request, replacements);
+            if let Some(max_output_tokens) = max_output_tokens {
+                // Only lowers the reserve; a higher value is ignored.
+                let current = request.effective_max_output_tokens(model.max_output_tokens());
+                if current.is_none_or(|current| max_output_tokens < current) {
+                    request.max_output_tokens = Some(max_output_tokens);
+                }
+            }
             if !hook_reminders.is_empty() {
                 // The cap applies to the reminders of all hooks together.
                 let added = hook_reminders
@@ -1343,29 +1380,23 @@ impl ModelHooks {
         }
     }
 
-    /// Runs the `AfterModel` hooks in declaration order. They observe the
-    /// generation; this version of Zed applies nothing they return.
+    /// Runs the `AfterModel` hooks in declaration order. A `usage` they return
+    /// replaces the reported one for the next hooks; the last one is returned,
+    /// for Zed to record as the provider's.
     async fn run_after_model(
         &self,
         mut event_fields: serde_json::Value,
         end: ResponseEnd,
         started_at: Instant,
         cx: &AsyncApp,
-    ) {
+    ) -> Option<TokenUsage> {
+        let mut reported_usage = None;
         if let Some(fields) = event_fields.as_object_mut() {
             fields.insert(
                 "stop_reason".into(),
                 json!(end.stop_reason.map(stop_reason_name)),
             );
-            fields.insert(
-                "usage".into(),
-                json!({
-                    "input_tokens": end.usage.input_tokens,
-                    "output_tokens": end.usage.output_tokens,
-                    "cache_creation_input_tokens": end.usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": end.usage.cache_read_input_tokens,
-                }),
-            );
+            fields.insert("usage".into(), usage_to_contract(&end.usage));
             fields.insert(
                 "duration_ms".into(),
                 json!(end.ended_at.duration_since(started_at).as_millis() as u64),
@@ -1380,15 +1411,200 @@ impl ModelHooks {
                     continue;
                 }
             };
-            match check_model_hook_output("AfterModel", &output) {
-                Ok(()) => log_unsupported_output_fields(
-                    &output,
-                    &["/systemMessage", "/hookSpecificOutput/usage"],
-                ),
-                Err(error) => log::warn!("AfterModel hook output ignored: {error:#}"),
+            let usage = match check_model_hook_output("AfterModel", &output)
+                .and_then(|()| hook_usage(&output))
+            {
+                Ok(usage) => usage,
+                Err(error) => {
+                    log::warn!("AfterModel hook output ignored: {error:#}");
+                    continue;
+                }
+            };
+            log_unsupported_output_fields(&output, &["/systemMessage"]);
+            if let Some(usage) = usage {
+                if let Some(fields) = event_fields.as_object_mut() {
+                    fields.insert("usage".into(), usage_to_contract(&usage));
+                }
+                reported_usage = Some(usage);
             }
         }
+        reported_usage
     }
+}
+
+/// The `ZedModelError` hooks of one request.
+#[derive(Clone)]
+struct ErrorHooks {
+    context: HookContext,
+    hooks: Vec<Arc<dyn HookHandler>>,
+    request_fields: serde_json::Value,
+}
+
+impl ErrorHooks {
+    /// Runs the hooks in declaration order on a provider rejection: each one
+    /// may change the category Zed acts on, for example into a full context
+    /// window, which makes Zed compact. Other errors pass unchanged, and so
+    /// does the rejection when the request is cancelled while the hooks run.
+    async fn translate(
+        &self,
+        error: LanguageModelCompletionError,
+        cancellation: Option<watch::Receiver<bool>>,
+        cx: &AsyncApp,
+    ) -> LanguageModelCompletionError {
+        let LanguageModelCompletionError::ProviderRejection {
+            provider,
+            status,
+            code,
+            message,
+            retry_after,
+            category,
+        } = error
+        else {
+            return error;
+        };
+        let original_category = category.clone();
+        let category = {
+            let translated =
+                self.translate_category(status, &code, &message, retry_after, &category, cx);
+            let cancelled = wait_for_cancellation(cancellation);
+            futures::pin_mut!(translated, cancelled);
+            match futures::future::select(translated, cancelled).await {
+                futures::future::Either::Left((translated, _)) => translated,
+                // Dropping the hooks' tasks kills their processes.
+                futures::future::Either::Right(_) => original_category,
+            }
+        };
+        LanguageModelCompletionError::ProviderRejection {
+            provider,
+            status,
+            code,
+            message,
+            retry_after,
+            category,
+        }
+    }
+
+    async fn translate_category(
+        &self,
+        status: Option<http_client::StatusCode>,
+        code: &Option<String>,
+        message: &str,
+        retry_after: Option<Duration>,
+        category: &ProviderErrorCategory,
+        cx: &AsyncApp,
+    ) -> ProviderErrorCategory {
+        let mut category = category.clone();
+        let request_id = self.request_fields["request_id"]
+            .as_str()
+            .unwrap_or_default();
+        let short_message = message.chars().take(200).collect::<String>();
+        for hook in &self.hooks {
+            let mut fields = self.request_fields.clone();
+            if let Some(fields) = fields.as_object_mut() {
+                fields.remove("is_compaction");
+                fields.insert(
+                    "provider_error".into(),
+                    json!({
+                        "status": status.map(|status| status.as_u16()),
+                        "code": code,
+                        "message": message,
+                        "zed_category": category_name(&category),
+                        "retry_after_ms": retry_after.map(|delay| delay.as_millis() as u64),
+                    }),
+                );
+            }
+            let input = self.context.input("ZedModelError", fields);
+            let output = match cx.update(|cx| hook.call(input, cx)).await {
+                Ok(output) => output,
+                Err(error) => {
+                    log::warn!(
+                        "ZedModelError hook failed, continuing (request {request_id}, status \
+                         {status:?}, category {}): {error:#}",
+                        category_name(&category)
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = check_model_hook_output("ZedModelError", &output) {
+                log::warn!(
+                    "ZedModelError hook output ignored (request {request_id}, status \
+                     {status:?}, category {}): {error:#}",
+                    category_name(&category)
+                );
+                continue;
+            }
+            // Deviation from the 0.1 contract: `systemMessage` is not shown to
+            // the user yet, only logged.
+            log_unsupported_output_fields(&output, &["/systemMessage"]);
+            let name = match output.pointer("/hookSpecificOutput/category") {
+                None | Some(serde_json::Value::Null) => continue,
+                Some(name) => name.as_str().unwrap_or_default(),
+            };
+            let prompt_tokens = output
+                .pointer("/hookSpecificOutput/prompt_tokens")
+                .and_then(serde_json::Value::as_u64);
+            // A hook that turns a rejection into `rate_limit`, `overloaded` or
+            // `timeout` makes it transient: Zed retries the request, up to
+            // `MAX_RETRY_ATTEMPTS`, and runs these hooks again each time.
+            match parse_category(name, prompt_tokens) {
+                Some(new_category) => {
+                    if new_category != category {
+                        log::info!(
+                            "ZedModelError hook changed the category from {} to {} (request \
+                             {request_id}, status {status:?}): {short_message}",
+                            category_name(&category),
+                            category_name(&new_category)
+                        );
+                    }
+                    category = new_category;
+                }
+                None => log::warn!(
+                    "ZedModelError hook named an unknown category {name:?} (request \
+                     {request_id}, status {status:?})"
+                ),
+            }
+        }
+        category
+    }
+}
+
+/// Runs the `ZedModelError` hooks on the provider rejections of a stream.
+fn translate_stream_errors(
+    stream: LanguageModelCompletionStream,
+    hooks: ErrorHooks,
+    cx: &AsyncApp,
+) -> LanguageModelCompletionStream {
+    let (errors_tx, mut errors_rx) = mpsc::unbounded::<(
+        LanguageModelCompletionError,
+        oneshot::Sender<LanguageModelCompletionError>,
+    )>();
+    // Not detached: dropping the stream drops this task, which abandons the
+    // hooks and kills their processes.
+    let translator = cx.spawn(async move |cx| {
+        while let Some((error, reply_tx)) = errors_rx.next().await {
+            reply_tx.send(hooks.translate(error, None, cx).await).ok();
+        }
+    });
+    stream
+        .then(move |event| {
+            let _translator = &translator;
+            let errors_tx = errors_tx.clone();
+            async move {
+                match event {
+                    Err(error @ LanguageModelCompletionError::ProviderRejection { .. }) => {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        if let Err(send_error) = errors_tx.unbounded_send((error, reply_tx)) {
+                            return Err(send_error.into_inner().0);
+                        }
+                        Err(reply_rx.await.unwrap_or_else(|_| {
+                            anyhow!("the ZedModelError hooks were abandoned").into()
+                        }))
+                    }
+                    event => event,
+                }
+            }
+        })
+        .boxed()
 }
 
 /// A text field of a hook output, trimmed. A field that is present must be
@@ -1552,6 +1768,126 @@ async fn run_post_compact(
     (!passages.is_empty()).then(|| passages.join("\n\n"))
 }
 
+/// The non-system messages of a request, in the contract's shape.
+fn conversation_messages(request: &LanguageModelRequest) -> Vec<serde_json::Value> {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role != Role::System)
+        .map(message_to_contract)
+        .collect()
+}
+
+/// The `tool_result_replacements` of a `BeforeModel` output. Each one must
+/// target a tool result of this request.
+fn tool_result_replacements(
+    output: &serde_json::Value,
+    request: &LanguageModelRequest,
+) -> Result<Vec<(String, String)>> {
+    let replacements = match output.pointer("/hookSpecificOutput/tool_result_replacements") {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(replacements) => replacements
+            .as_array()
+            .context("`tool_result_replacements` must be a list")?,
+    };
+    replacements
+        .iter()
+        .map(|replacement| {
+            let tool_use_id = replacement["tool_use_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .context("a replacement needs a `tool_use_id`")?;
+            let text = replacement["text"]
+                .as_str()
+                .context("a replacement needs a `text`")?;
+            let targets_a_result = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|part| {
+                    matches!(part, MessageContent::ToolResult(result)
+                        if result.tool_use_id.to_string() == tool_use_id)
+                });
+            anyhow::ensure!(
+                targets_a_result,
+                "no tool result `{tool_use_id}` in this request"
+            );
+            Ok((tool_use_id.to_string(), text.to_string()))
+        })
+        .collect()
+}
+
+/// Replaces the text of tool results, in this request only.
+fn replace_tool_results(request: &mut LanguageModelRequest, replacements: Vec<(String, String)>) {
+    for (tool_use_id, text) in replacements {
+        for part in request
+            .messages
+            .iter_mut()
+            .flat_map(|message| &mut message.content)
+        {
+            if let MessageContent::ToolResult(result) = part
+                && result.tool_use_id.to_string() == tool_use_id
+            {
+                result.content = vec![LanguageModelToolResultContent::Text(text.clone().into())];
+            }
+        }
+    }
+}
+
+/// The `max_output_tokens` of a `BeforeModel` output: a whole number, at
+/// least 1.
+fn hook_max_output_tokens(output: &serde_json::Value) -> Result<Option<u64>> {
+    match output.pointer("/hookSpecificOutput/max_output_tokens") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let max_output_tokens = value
+                .as_u64()
+                .filter(|max| *max >= 1)
+                .context("`max_output_tokens` must be a whole number, at least 1")?;
+            Ok(Some(max_output_tokens))
+        }
+    }
+}
+
+/// The `usage` of an `AfterModel` output, with its four counts.
+fn hook_usage(output: &serde_json::Value) -> Result<Option<TokenUsage>> {
+    let usage = match output.pointer("/hookSpecificOutput/usage") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(usage) => usage,
+    };
+    // At most 2^53 - 1, the largest integer JSON carries exactly; Zed adds the
+    // counts together, so their sum must not overflow either.
+    const MAX_COUNT: u64 = (1 << 53) - 1;
+    let count = |field: &str| {
+        usage[field]
+            .as_u64()
+            .filter(|count| *count <= MAX_COUNT)
+            .with_context(|| format!("`usage.{field}` must be a whole number, at most {MAX_COUNT}"))
+    };
+    let usage = TokenUsage {
+        input_tokens: count("input_tokens")?,
+        output_tokens: count("output_tokens")?,
+        cache_creation_input_tokens: count("cache_creation_input_tokens")?,
+        cache_read_input_tokens: count("cache_read_input_tokens")?,
+    };
+    usage
+        .input_tokens
+        .checked_add(usage.output_tokens)
+        .and_then(|total| total.checked_add(usage.cache_creation_input_tokens))
+        .and_then(|total| total.checked_add(usage.cache_read_input_tokens))
+        .context("the `usage` counts add up beyond what Zed can hold")?;
+    Ok(Some(usage))
+}
+
+fn usage_to_contract(usage: &TokenUsage) -> serde_json::Value {
+    json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+    })
+}
+
 /// Resolves once `cancellation` is set; never without one.
 async fn wait_for_cancellation(cancellation: Option<watch::Receiver<bool>>) {
     if let Some(mut cancellation) = cancellation {
@@ -1601,11 +1937,15 @@ struct ResponseEnd {
     ended_at: Instant,
 }
 
-/// Passes the response through unchanged, and sends how it ended once the
-/// stream finishes without error.
+/// Passes the response through unchanged. Once it ends without error, sends
+/// how it ended to the `AfterModel` hooks and waits for them; a usage they
+/// return ends the stream as one more usage update, which Zed records like
+/// the provider's: in the turn, before its next request, and not for a
+/// compaction, whose usage is not the context size.
 fn observe_response_end(
     stream: LanguageModelCompletionStream,
     end_tx: oneshot::Sender<ResponseEnd>,
+    usage_rx: oneshot::Receiver<Option<TokenUsage>>,
 ) -> LanguageModelCompletionStream {
     let end = ResponseEnd {
         stop_reason: None,
@@ -1613,20 +1953,24 @@ fn observe_response_end(
         ended_at: Instant::now(),
     };
     futures::stream::unfold(
-        (stream, Some((end_tx, end))),
+        // Some provider streams panic when polled after their end.
+        (stream.fuse().boxed(), Some((end_tx, end, usage_rx))),
         |(mut stream, mut end)| async move {
             let Some(event) = stream.next().await else {
-                if let Some((end_tx, mut end)) = end.take() {
-                    end.ended_at = Instant::now();
-                    end_tx.send(end).ok();
-                }
-                return None;
+                let (end_tx, mut end, usage_rx) = end.take()?;
+                end.ended_at = Instant::now();
+                end_tx.send(end).ok()?;
+                let usage = usage_rx.await.ok()??;
+                return Some((
+                    Ok(LanguageModelCompletionEvent::UsageUpdate(usage)),
+                    (stream, None),
+                ));
             };
             match (&event, end.as_mut()) {
-                (Ok(LanguageModelCompletionEvent::Stop(reason)), Some((_, end))) => {
+                (Ok(LanguageModelCompletionEvent::Stop(reason)), Some((_, end, _))) => {
                     end.stop_reason = Some(*reason);
                 }
-                (Ok(LanguageModelCompletionEvent::UsageUpdate(usage)), Some((_, end))) => {
+                (Ok(LanguageModelCompletionEvent::UsageUpdate(usage)), Some((_, end, _))) => {
                     end.usage = *usage;
                 }
                 (Err(_), _) => end = None,
@@ -1760,6 +2104,49 @@ fn is_compaction_request(request: &LanguageModelRequest) -> bool {
 /// compaction summary, nor to the title.
 fn applies_system_prompt_insert(request: &LanguageModelRequest) -> bool {
     !is_compaction_request(request) && request.intent != Some(CompletionIntent::ThreadSummarization)
+}
+
+/// The contract's snake_case name of an error category.
+fn category_name(category: &ProviderErrorCategory) -> &'static str {
+    match category {
+        ProviderErrorCategory::PromptTooLarge { .. } => "prompt_too_large",
+        ProviderErrorCategory::InvalidEncryptedContent => "invalid_encrypted_content",
+        ProviderErrorCategory::Authentication => "authentication",
+        ProviderErrorCategory::Permission => "permission",
+        ProviderErrorCategory::ContentPolicy => "content_policy",
+        ProviderErrorCategory::EndpointNotFound => "endpoint_not_found",
+        ProviderErrorCategory::PaymentRequired => "payment_required",
+        ProviderErrorCategory::RateLimit => "rate_limit",
+        ProviderErrorCategory::Overloaded => "overloaded",
+        ProviderErrorCategory::InvalidRequest => "invalid_request",
+        ProviderErrorCategory::Conflict => "conflict",
+        ProviderErrorCategory::Timeout => "timeout",
+        ProviderErrorCategory::InternalServer => "internal_server",
+        ProviderErrorCategory::Other => "other",
+    }
+}
+
+/// The error category a hook names, with its token count for a full window.
+fn parse_category(name: &str, prompt_tokens: Option<u64>) -> Option<ProviderErrorCategory> {
+    Some(match name {
+        "prompt_too_large" => ProviderErrorCategory::PromptTooLarge {
+            tokens: prompt_tokens,
+        },
+        "invalid_encrypted_content" => ProviderErrorCategory::InvalidEncryptedContent,
+        "authentication" => ProviderErrorCategory::Authentication,
+        "permission" => ProviderErrorCategory::Permission,
+        "content_policy" => ProviderErrorCategory::ContentPolicy,
+        "endpoint_not_found" => ProviderErrorCategory::EndpointNotFound,
+        "payment_required" => ProviderErrorCategory::PaymentRequired,
+        "rate_limit" => ProviderErrorCategory::RateLimit,
+        "overloaded" => ProviderErrorCategory::Overloaded,
+        "invalid_request" => ProviderErrorCategory::InvalidRequest,
+        "conflict" => ProviderErrorCategory::Conflict,
+        "timeout" => ProviderErrorCategory::Timeout,
+        "internal_server" => ProviderErrorCategory::InternalServer,
+        "other" => ProviderErrorCategory::Other,
+        _ => return None,
+    })
 }
 
 /// The contract's names of the intents a model hook can match.
@@ -2331,7 +2718,15 @@ pub(crate) mod tests {
         assert!(created);
     }
 
-    const CONTRACT_SCHEMAS: [(&str, &str); 16] = [
+    const CONTRACT_SCHEMAS: [(&str, &str); 18] = [
+        (
+            "ZedModelError.input.schema.json",
+            include_str!("../hook_contract/ZedModelError.input.schema.json"),
+        ),
+        (
+            "ZedModelError.output.schema.json",
+            include_str!("../hook_contract/ZedModelError.output.schema.json"),
+        ),
         (
             "PreCompact.input.schema.json",
             include_str!("../hook_contract/PreCompact.input.schema.json"),
@@ -3472,5 +3867,404 @@ pub(crate) mod tests {
             .await;
 
         assert_eq!(texts, ["summary", "\n\nPlan."]);
+    }
+
+    #[test]
+    fn test_zed_model_error_is_read_and_zed_count_tokens_refused() {
+        let check = json!({ "type": "command", "command": "check" });
+        let hooks = AgentHooks::from_settings(
+            &json!({ "ZedModelError": [{ "matcher": "user_prompt", "hooks": [check.clone()] }] }),
+            Path::new("/data/hooks"),
+        )
+        .unwrap();
+        assert_eq!(
+            matching_hooks(&hooks.zed_model_error, "user_prompt").len(),
+            1
+        );
+
+        let error = AgentHooks::from_settings(
+            &json!({ "ZedCountTokens": [{ "hooks": [check] }] }),
+            Path::new("/data/hooks"),
+        )
+        .err()
+        .expect("ZedCountTokens is not run yet")
+        .to_string();
+        assert!(error.contains("ZedCountTokens"), "{error}");
+    }
+
+    #[test]
+    fn test_error_categories_round_trip_through_their_names() {
+        let categories = [
+            ProviderErrorCategory::PromptTooLarge {
+                tokens: Some(130_000),
+            },
+            ProviderErrorCategory::InvalidEncryptedContent,
+            ProviderErrorCategory::Authentication,
+            ProviderErrorCategory::Permission,
+            ProviderErrorCategory::ContentPolicy,
+            ProviderErrorCategory::EndpointNotFound,
+            ProviderErrorCategory::PaymentRequired,
+            ProviderErrorCategory::RateLimit,
+            ProviderErrorCategory::Overloaded,
+            ProviderErrorCategory::InvalidRequest,
+            ProviderErrorCategory::Conflict,
+            ProviderErrorCategory::Timeout,
+            ProviderErrorCategory::InternalServer,
+            ProviderErrorCategory::Other,
+        ];
+        for category in categories {
+            let name = category_name(&category);
+            let tokens = match category {
+                ProviderErrorCategory::PromptTooLarge { tokens } => tokens,
+                _ => None,
+            };
+            assert_eq!(parse_category(name, tokens), Some(category), "{name}");
+        }
+        assert_eq!(parse_category("not_a_category", None), None);
+    }
+
+    fn too_long_rejection() -> LanguageModelCompletionError {
+        LanguageModelCompletionError::from_http_status(
+            language_model::LanguageModelProviderName::new("vllm"),
+            http_client::StatusCode::BAD_REQUEST,
+            "Input is too long for this model.".to_string(),
+            None,
+        )
+    }
+
+    fn error_hooks(hooks: Vec<Arc<dyn HookHandler>>) -> ErrorHooks {
+        ErrorHooks {
+            context: HookContext {
+                session_id: "session-1".into(),
+                cwd: "/project".into(),
+                thread_id: "session-1".into(),
+                parent_thread_id: None,
+                depth: 0,
+            },
+            hooks,
+            request_fields: json!({
+                "request_id": "6f1c2a7e-0b3d-4e5f-8a9b-1c2d3e4f5a6b",
+                "intent": "user_prompt",
+                "model": { "provider": "openai_compatible", "id": "qwen" },
+                "is_compaction": false,
+            }),
+        }
+    }
+
+    fn category_of(error: &LanguageModelCompletionError) -> Option<ProviderErrorCategory> {
+        match error {
+            LanguageModelCompletionError::ProviderRejection { category, .. } => {
+                Some(category.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn to_full_window() -> (Arc<dyn HookHandler>, Rc<RefCell<Vec<serde_json::Value>>>) {
+        fake_hook(Ok(json!({
+            "hookSpecificOutput": { "hookEventName": "ZedModelError", "category": "prompt_too_large" }
+        })))
+    }
+
+    #[test]
+    fn test_a_vllm_400_with_an_integer_code_is_a_provider_rejection() {
+        let body = json!({
+            "object": "error",
+            "message": "This model's maximum context length is 122880 tokens. However, you requested 122880 output tokens and your prompt contains 302 characters (more than 0 characters, which is the upper bound for 0 input tokens). Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_text, value=302)",
+            "type": "BadRequestError",
+            "param": "input_text",
+            "code": 400,
+        });
+        let error = LanguageModelCompletionError::from(open_ai::RequestError::HttpResponseError {
+            provider: "vllm".into(),
+            status_code: http_client::StatusCode::BAD_REQUEST,
+            body: body.to_string(),
+            headers: Box::default(),
+        });
+
+        assert!(
+            matches!(
+                &error,
+                LanguageModelCompletionError::ProviderRejection { status: Some(status), .. }
+                    if status.as_u16() == 400
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_translate_changes_only_a_provider_rejection(cx: &mut TestAppContext) {
+        let (hook, calls) = to_full_window();
+        let hooks = error_hooks(vec![hook]);
+        let cx = cx.to_async();
+
+        let translated = hooks.translate(too_long_rejection(), None, &cx).await;
+        assert_eq!(
+            category_of(&translated),
+            Some(ProviderErrorCategory::PromptTooLarge { tokens: None })
+        );
+
+        let other = hooks
+            .translate(anyhow!("connection reset").into(), None, &cx)
+            .await;
+        assert!(category_of(&other).is_none());
+        assert_eq!(calls.borrow().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_translate_keeps_the_error_when_hooks_fail(cx: &mut TestAppContext) {
+        let (failing, _) = fake_hook(Err("hook crashed".into()));
+        let hooks = error_hooks(vec![failing]);
+
+        let translated = hooks
+            .translate(too_long_rejection(), None, &cx.to_async())
+            .await;
+
+        assert_eq!(
+            category_of(&translated),
+            Some(ProviderErrorCategory::InvalidRequest)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cancelling_abandons_the_error_hooks_at_send(cx: &mut TestAppContext) {
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let pending: Arc<dyn HookHandler> = Arc::new(PendingHook {
+            abandoned: abandoned.clone(),
+        });
+        let hooks = error_hooks(vec![pending]);
+        let (mut cancellation_tx, cancellation_rx) = watch::channel(false);
+        let task = cx.update(|cx| {
+            cx.spawn(async move |cx| {
+                hooks
+                    .translate(too_long_rejection(), Some(cancellation_rx), cx)
+                    .await
+            })
+        });
+        cx.run_until_parked();
+
+        cancellation_tx.send(true).ok();
+        cx.run_until_parked();
+
+        let mut task = task;
+        let error = futures::FutureExt::now_or_never(&mut task)
+            .expect("cancelling must stop the error hooks");
+        assert_eq!(
+            category_of(&error),
+            Some(ProviderErrorCategory::InvalidRequest)
+        );
+        assert!(abandoned.load(Ordering::SeqCst));
+    }
+
+    #[gpui::test]
+    async fn test_stream_errors_are_translated_after_text(cx: &mut TestAppContext) {
+        let (hook, _) = to_full_window();
+        let stream = futures::stream::iter(vec![
+            Ok(LanguageModelCompletionEvent::Text("partial".into())),
+            Err(too_long_rejection()),
+        ])
+        .boxed();
+
+        let events = translate_stream_errors(stream, error_hooks(vec![hook]), &cx.to_async())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            &events[0],
+            Ok(LanguageModelCompletionEvent::Text(text)) if text == "partial"
+        ));
+        assert_eq!(
+            events[1].as_ref().err().and_then(category_of),
+            Some(ProviderErrorCategory::PromptTooLarge { tokens: None })
+        );
+    }
+
+    #[gpui::test]
+    async fn test_stream_errors_other_than_rejections_pass_unchanged(cx: &mut TestAppContext) {
+        let (hook, calls) = to_full_window();
+        let stream = futures::stream::iter(vec![Err(anyhow!("connection reset").into())]).boxed();
+
+        let events = translate_stream_errors(stream, error_hooks(vec![hook]), &cx.to_async())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events[0].as_ref().err().and_then(category_of).is_none());
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_dropping_the_stream_abandons_the_error_hooks(cx: &mut TestAppContext) {
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let pending: Arc<dyn HookHandler> = Arc::new(PendingHook {
+            abandoned: abandoned.clone(),
+        });
+        let stream = futures::stream::iter(vec![Err(too_long_rejection())]).boxed();
+        let mut stream =
+            translate_stream_errors(stream, error_hooks(vec![pending]), &cx.to_async());
+        {
+            let next = stream.next();
+            futures::pin_mut!(next);
+            assert!(futures::FutureExt::now_or_never(&mut next).is_none());
+            cx.run_until_parked();
+        }
+
+        drop(stream);
+        cx.run_until_parked();
+
+        assert!(abandoned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_an_absurd_usage_is_refused() {
+        let output = |input_tokens: u64| {
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "AfterModel",
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 10,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
+                }
+            })
+        };
+
+        assert!(hook_usage(&output(950_000)).unwrap().is_some());
+        assert!(hook_usage(&output(u64::MAX - 1)).is_err());
+        assert!(hook_usage(&output(1 << 53)).is_err());
+    }
+
+    /// A provider that rejects every request when it is sent, the way the
+    /// OpenAI-compatible provider reports vLLM's 400.
+    struct RejectingProvider;
+
+    impl language_model::LanguageModelClient for RejectingProvider {
+        fn stream_completion(
+            &self,
+            _model: &LanguageModel,
+            _request: LanguageModelRequest,
+            _cx: &AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<LanguageModelCompletionStream, LanguageModelCompletionError>,
+        > {
+            async { Err(too_long_rejection()) }.boxed()
+        }
+    }
+
+    impl LanguageModelProvider for RejectingProvider {
+        fn id(&self) -> LanguageModelProviderId {
+            LanguageModelProviderId::new("rejecting")
+        }
+
+        fn name(&self) -> language_model::LanguageModelProviderName {
+            language_model::LanguageModelProviderName::new("rejecting")
+        }
+
+        fn default_model(&self, _cx: &App) -> Option<LanguageModel> {
+            None
+        }
+
+        fn default_fast_model(&self, _cx: &App) -> Option<LanguageModel> {
+            None
+        }
+
+        fn provided_models(&self, _cx: &App) -> Vec<LanguageModel> {
+            Vec::new()
+        }
+
+        fn is_authenticated(&self, _cx: &App) -> bool {
+            true
+        }
+
+        fn authenticate(
+            &self,
+            _cx: &mut App,
+        ) -> Task<Result<(), language_model::AuthenticateError>> {
+            Task::ready(Ok(()))
+        }
+
+        fn settings_view(&self, _cx: &mut App) -> Option<language_model::ProviderSettingsView> {
+            None
+        }
+    }
+
+    fn error_model_hooks(zed_model_error: Vec<Arc<dyn HookHandler>>) -> ModelHooks {
+        ModelHooks {
+            context: error_hooks(Vec::new()).context,
+            before_model: Vec::new(),
+            after_model: Vec::new(),
+            compaction_trigger: None,
+            pre_compact: Vec::new(),
+            post_compact: Vec::new(),
+            zed_model_error,
+        }
+    }
+
+    fn test_model() -> LanguageModel {
+        language_model::fake_provider::FakeLanguageModelProvider::new(
+            LanguageModelProviderId::new("fake"),
+            language_model::LanguageModelProviderName::new("fake"),
+        )
+        .model("qwen")
+    }
+
+    #[gpui::test]
+    async fn test_a_rejection_at_send_goes_through_the_error_hooks(cx: &mut TestAppContext) {
+        let (hook, _) = to_full_window();
+        let provider: Arc<dyn LanguageModelProvider> = Arc::new(RejectingProvider);
+
+        let result = error_model_hooks(vec![hook])
+            .stream_completion(
+                &provider,
+                &test_model(),
+                LanguageModelRequest::default(),
+                None,
+                &cx.to_async(),
+            )
+            .await;
+
+        let error = result.err().expect("the request is rejected");
+        assert_eq!(
+            category_of(&error),
+            Some(ProviderErrorCategory::PromptTooLarge { tokens: None })
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cancelling_a_rejection_at_send_abandons_the_error_hooks(cx: &mut TestAppContext) {
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let pending: Arc<dyn HookHandler> = Arc::new(PendingHook {
+            abandoned: abandoned.clone(),
+        });
+        let provider: Arc<dyn LanguageModelProvider> = Arc::new(RejectingProvider);
+        let (mut cancellation_tx, cancellation_rx) = watch::channel(false);
+        let mut task = cx.update(|cx| {
+            cx.spawn(async move |cx| {
+                error_model_hooks(vec![pending])
+                    .stream_completion(
+                        &provider,
+                        &test_model(),
+                        LanguageModelRequest::default(),
+                        Some(cancellation_rx),
+                        cx,
+                    )
+                    .await
+            })
+        });
+        cx.run_until_parked();
+
+        cancellation_tx.send(true).ok();
+        cx.run_until_parked();
+
+        let result = futures::FutureExt::now_or_never(&mut task)
+            .expect("cancelling must stop the error hooks");
+        let error = result.err().expect("the request is rejected");
+        assert_eq!(
+            category_of(&error),
+            Some(ProviderErrorCategory::InvalidRequest)
+        );
+        assert!(abandoned.load(Ordering::SeqCst));
     }
 }

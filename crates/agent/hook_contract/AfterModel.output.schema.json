@@ -27,7 +27,7 @@
         "usage": {
           "type": "object",
           "$ref": "model-message.schema.json#/$defs/Usage",
-          "description": "Usage that replaces the reported one."
+          "description": "Usage that replaces the reported one. Zed keeps it as if the provider had sent it: a real size above the compaction threshold triggers compaction before the next request."
         }
       }
     }

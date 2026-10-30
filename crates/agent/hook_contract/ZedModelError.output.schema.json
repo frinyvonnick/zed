@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.invalid/zed-agent-hooks/0.1/schemas/ZedModelError.output.schema.json",
+  "title": "ZedModelError output",
+  "description": "Translates the error into a category Zed acts on (for example prompt_too_large, which triggers Zed compaction). Closed: this event has no Claude Code counterpart to stay compatible with.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [],
+  "properties": {
+    "systemMessage": {
+      "type": "string",
+      "description": "Warning shown to the user in the agent panel."
+    },
+    "hookSpecificOutput": {
+      "type": "object",
+      "description": "Event-specific output.",
+      "additionalProperties": false,
+      "required": [
+        "hookEventName",
+        "category"
+      ],
+      "properties": {
+        "hookEventName": {
+          "type": "string",
+          "description": "Must be this event name; a mismatch is a hook failure.",
+          "const": "ZedModelError"
+        },
+        "category": {
+          "type": "string",
+          "description": "Category Zed uses instead of its own.",
+          "enum": [
+            "prompt_too_large",
+            "invalid_encrypted_content",
+            "authentication",
+            "permission",
+            "content_policy",
+            "endpoint_not_found",
+            "payment_required",
+            "rate_limit",
+            "overloaded",
+            "invalid_request",
+            "conflict",
+            "timeout",
+            "internal_server",
+            "other"
+          ]
+        },
+        "prompt_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "For prompt_too_large: token count, if the hook knows it.",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

@@ -47,8 +47,7 @@
         "SubagentStop",
         "BeforeModel",
         "AfterModel",
-        "ZedModelError",
-        "ZedCountTokens"
+        "ZedModelError"
       ]
     },
     "agent_id": {
