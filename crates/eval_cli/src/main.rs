@@ -365,6 +365,21 @@ fn apply_openai_compatible_providers(providers_json: &str, cx: &mut gpui::App) -
     Ok(())
 }
 
+/// Name of the env var carrying the JSON of `agent.hooks`: the agent hooks of
+/// the run, in the shape of Zed's settings.
+const AGENT_HOOKS_ENV: &str = "ZED_EVAL_AGENT_HOOKS";
+
+/// The `"hooks"` field to append to the `agent` settings of the run, or an
+/// empty string when there are no hooks.
+fn agent_hooks_field(hooks_json: Option<&str>) -> Result<String> {
+    let Some(hooks_json) = hooks_json.filter(|json| !json.trim().is_empty()) else {
+        return Ok(String::new());
+    };
+    serde_json::from_str::<serde_json::Value>(hooks_json)
+        .with_context(|| format!("{AGENT_HOOKS_ENV} is not valid JSON"))?;
+    Ok(format!(r#","hooks": {hooks_json}"#))
+}
+
 /// Name of the env var carrying a JSON array to merge into
 /// `language_models.anthropic.available_models` user settings before model
 /// discovery, in the same shape as Zed's `anthropic.available_models` settings
@@ -585,6 +600,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_hooks_field_joins_the_agent_settings() {
+        let hooks = r#"{"BeforeModel": [{"hooks": [{"type": "command", "command": "node"}]}]}"#;
+        let agent = |field: String| {
+            serde_json::from_str::<serde_json::Value>(&format!(r#"{{"default": "allow"{field}}}"#))
+                .unwrap()
+        };
+
+        assert_eq!(
+            agent(agent_hooks_field(None).unwrap()),
+            serde_json::json!({ "default": "allow" })
+        );
+        assert_eq!(
+            agent(agent_hooks_field(Some(hooks)).unwrap()),
+            serde_json::json!({
+                "default": "allow",
+                "hooks": {
+                    "BeforeModel": [{ "hooks": [{ "type": "command", "command": "node" }] }]
+                }
+            })
+        );
+        let error = agent_hooks_field(Some("not json")).unwrap_err();
+        assert!(format!("{error:#}").contains(AGENT_HOOKS_ENV), "{error:#}");
+    }
+
+    #[test]
     fn non_anthropic_models_require_exact_ids() {
         assert!(!model_id_matches_selected(
             &LanguageModelProviderId("other".into()),
@@ -713,6 +753,7 @@ async fn run_agent(
         } else {
             r#"{"warn_ntfs_grants": false}"#
         };
+        let hooks_field = agent_hooks_field(std::env::var(AGENT_HOOKS_ENV).ok().as_deref())?;
         SettingsStore::update_global(cx, |store, cx| {
             let settings = format!(
                 r#"{{
@@ -725,7 +766,7 @@ async fn run_agent(
                             "model": "{model_id}",
                             "enable_thinking": {enable_thinking},
                             "effort": {effort}
-                        }}{profile_field}
+                        }}{profile_field}{hooks_field}
                     }},
                     "autosave": "off",
                     "format_on_save": "off"
