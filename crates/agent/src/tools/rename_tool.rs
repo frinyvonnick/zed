@@ -74,7 +74,10 @@ impl AgentTool for RenameTool {
                 .await
                 .map_err(|e| format!("Failed to receive tool input: {e}"))?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
+            let resolved = input
+                .symbol
+                .resolve(&project, |server| server.rename_provider.is_some(), cx)
+                .await?;
 
             let rename_task = project.update(cx, |project, cx| {
                 project.perform_rename(

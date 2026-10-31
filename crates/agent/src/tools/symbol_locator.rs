@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
 use std::fmt;
+use std::time::Duration;
 
+use futures::{FutureExt as _, StreamExt as _, channel::mpsc};
 use gpui::{App, AsyncApp, Entity};
 use language::{Buffer, Location};
-use project::{CodeAction, Project};
+use project::{CodeAction, Project, lsp_store::OpenLspBufferHandle};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use text::ToPoint as _;
@@ -36,7 +38,16 @@ pub struct ResolvedSymbol {
     pub position: Anchor,
     pub line_text: String,
     pub truncated: bool,
+    /// Keeps the buffer open in its language servers while the symbol is in use.
+    _lsp_handle: OpenLspBufferHandle,
 }
+
+/// How long a tool waits for the language servers of the file it opened.
+const LANGUAGE_SERVERS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a ready server must stay quiet: a server starts loading its project shortly after it
+/// opens the file, and answers for that file only until it has loaded it.
+const LANGUAGE_SERVERS_SETTLE: Duration = Duration::from_secs(1);
 
 pub const MAX_LINE_DISPLAY_LEN: usize = 200;
 
@@ -146,6 +157,7 @@ impl SymbolLocator {
     pub async fn resolve(
         &self,
         project: &Entity<Project>,
+        serves: fn(&lsp::ServerCapabilities) -> bool,
         cx: &mut AsyncApp,
     ) -> Result<ResolvedSymbol, String> {
         let Self {
@@ -164,6 +176,14 @@ impl SymbolLocator {
         let buffer = open_buffer_task
             .await
             .map_err(|e| format!("Failed to open '{}': {e}", self.file_path))?;
+
+        // A file no editor has open is known to no language server: register it, and wait for
+        // a server that `serves` the request, since a request only reaches the servers already
+        // running with the file open.
+        let lsp_handle = project.update(cx, |project, cx| {
+            project.register_buffer_with_language_servers(&buffer, cx)
+        });
+        wait_for_language_servers(project, &buffer, serves, cx).await;
 
         let (position, line_text, truncated) = buffer.read_with(cx, |buffer, _cx| {
             let snapshot = buffer.snapshot();
@@ -213,7 +233,76 @@ impl SymbolLocator {
             position,
             line_text,
             truncated,
+            _lsp_handle: lsp_handle,
         })
+    }
+}
+
+/// Waits until the buffer has a language and one of its language servers that `serves` the
+/// request runs with the buffer open and no work in progress (a server still loading its project
+/// answers for the open files only), and stays so for [`LANGUAGE_SERVERS_SETTLE`]. A server whose
+/// startup failed stays "starting", so the wait does not expect all of them. Gives up after
+/// [`LANGUAGE_SERVERS_TIMEOUT`].
+async fn wait_for_language_servers(
+    project: &Entity<Project>,
+    buffer: &Entity<Buffer>,
+    serves: fn(&lsp::ServerCapabilities) -> bool,
+    cx: &mut AsyncApp,
+) {
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let (changed_tx, mut changed_rx) = mpsc::unbounded();
+    let _subscriptions = cx.update(|cx| {
+        let buffer_changed = changed_tx.clone();
+        [
+            cx.subscribe(&lsp_store, move |_, _, _| {
+                changed_tx.unbounded_send(()).ok();
+            }),
+            cx.subscribe(buffer, move |_, _, _| {
+                buffer_changed.unbounded_send(()).ok();
+            }),
+        ]
+    });
+    let mut timeout = cx
+        .background_executor()
+        .timer(LANGUAGE_SERVERS_TIMEOUT)
+        .fuse();
+    loop {
+        let ready = buffer.update(cx, |buffer, cx| {
+            buffer.language().is_some()
+                && lsp_store.update(cx, |lsp_store, cx| {
+                    if lsp_store
+                        .language_servers_for_local_buffer(buffer, cx)
+                        .is_empty()
+                    {
+                        return true;
+                    }
+                    let opened =
+                        lsp_store.language_server_ids_for_opened_buffer(buffer.remote_id());
+                    lsp_store
+                        .running_language_servers_for_local_buffer(buffer, cx)
+                        .any(|(_, server)| {
+                            let id = server.server_id();
+                            opened.is_some_and(|opened| opened.contains(&id))
+                                && serves(&server.capabilities())
+                                && lsp_store
+                                    .language_server_statuses
+                                    .get(&id)
+                                    .is_some_and(|status| status.pending_work.is_empty())
+                        })
+                })
+        });
+        let mut settled = if ready {
+            cx.background_executor()
+                .timer(LANGUAGE_SERVERS_SETTLE)
+                .fuse()
+        } else {
+            futures::future::Fuse::terminated()
+        };
+        futures::select_biased! {
+            _ = changed_rx.next() => {}
+            _ = settled => return,
+            _ = timeout => return,
+        }
     }
 }
 

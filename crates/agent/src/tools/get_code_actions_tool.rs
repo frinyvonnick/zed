@@ -73,7 +73,10 @@ impl AgentTool for GetCodeActionsTool {
                 .await
                 .map_err(|e| format!("Failed to receive tool input: {e}"))?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
+            let resolved = input
+                .symbol
+                .resolve(&project, |server| server.code_action_provider.is_some(), cx)
+                .await?;
 
             let actions_task = project.update(cx, |project, cx| {
                 let range = resolved.position..resolved.position;

@@ -65,7 +65,10 @@ impl AgentTool for FindReferencesTool {
                 .await
                 .map_err(|e| format!("Failed to receive tool input: {e}"))?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
+            let resolved = input
+                .symbol
+                .resolve(&project, |server| server.references_provider.is_some(), cx)
+                .await?;
 
             let references_task = project.update(cx, |project, cx| {
                 project.references(&resolved.buffer, resolved.position, cx)
