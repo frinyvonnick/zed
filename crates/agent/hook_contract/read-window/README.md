@@ -20,7 +20,8 @@ Il faut node 24 ou plus, sans aucune dépendance.
 
 ## Ce qu'il décide
 
-- Il refuse un `read_file` sans `start_line` ni `end_line` sur un fichier de plus de 120 lignes.
+- Il refuse un `read_file` sans `start_line` ni `end_line` sur un fichier de plus de 120 lignes et
+  de 16 384 caractères ou moins.
 - Il refuse toute fenêtre de plus de 120 lignes. Une fenêtre à deux bornes se juge sur ce que le
   modèle demande (`end_line - start_line + 1`), sans ouvrir le fichier. Une fenêtre à une seule borne
   se mesure comme Zed la lit : de `start_line` à la fin du fichier, ou du début à `end_line`.
@@ -34,6 +35,11 @@ Il faut node 24 ou plus, sans aucune dépendance.
 ## Ce qu'il laisse passer
 
 - Un fichier de 120 lignes ou moins, lu en entier (un plan, une story, un petit fichier).
+- Un fichier de plus de 16 384 caractères lu sans fenêtre : Zed n'en renvoie pas le contenu mais le
+  plan (ses symboles et leurs lignes), ce qui aide à viser la fenêtre suivante. La limite est
+  `AUTO_OUTLINE_SIZE` de Zed (`crates/agent/src/outline.rs:10`), comparée par `>` à la longueur du
+  texte tel que Zed le garde, où chaque `\r\n` devient un `\n` (`crates/text/src/text.rs:48`) :
+  le crochet compte les caractères de la même façon.
 - Tout fichier sous `.agents/skills/` ou `.claude/skills/`, projet ou dossier personnel : une skill
   se lit en entier.
 - Un fichier qu'il ne trouve pas, une entrée illisible, un autre outil : aucune sortie, Zed exécute
