@@ -97,8 +97,24 @@ function deny(reason: string): object {
   };
 }
 
-const WHAT_TO_DO = 'Search first with grep (or a symbol search tool, if you have one) for the lines you need, '
-  + `then read_file a window of at most ${MAX_LINES} lines around them, with start_line and end_line.`;
+// The reasons follow the words of Zed's own answer for a large file
+// (crates/agent/src/tools/read_file_tool.rs:522-530), so that the model meets one way of saying it.
+const NEXT_STEPS = `NEXT STEPS: To read a specific section, call read_file with the same path plus start_line and end_line around the lines grep found, at most ${MAX_LINES} lines apart.\n`
+  + 'For example, to read a function grep found at L100, use start_line: 100 and end_line: 150.';
+
+function fileTooLarge(lines: number): string {
+  return `This file is too large to read all at once: it has ${lines} lines, and read_file returns at most ${MAX_LINES} lines at a time.\n\n`
+    + 'IMPORTANT: Do NOT retry this call without line numbers - you will get the same answer.\n'
+    + 'Instead, find the lines you need with grep first, then read them by calling this tool again with start_line and end_line parameters.\n\n'
+    + NEXT_STEPS;
+}
+
+function windowTooLarge(lines: number): string {
+  return `This window is too large to read at once: it covers ${lines} lines, and read_file returns at most ${MAX_LINES} lines at a time.\n\n`
+    + 'IMPORTANT: Do NOT retry this call with the same window - you will get the same answer.\n'
+    + `Instead, find the lines you need with grep first, then read them by calling this tool again with start_line and end_line at most ${MAX_LINES} lines apart.\n\n`
+    + NEXT_STEPS;
+}
 
 function main(): void {
   let input: any;
@@ -117,14 +133,14 @@ function main(): void {
     return;
   }
   const { start_line: start, end_line: end } = input.tool_input;
-  let what: string;
+  let reason: string;
   if (Number.isInteger(start) && Number.isInteger(end)) {
     // Both bounds: decided on what the model asked for, without reading the file.
     const asked = Math.max(end, start) - Math.max(start, 1) + 1;
     if (asked <= MAX_LINES) {
       return;
     }
-    what = `This window asks for ${asked} lines, more than ${MAX_LINES}.`;
+    reason = windowTooLarge(asked);
   } else {
     const whole = start == null && end == null;
     // At most one byte in two is the \r of a \r\n: beyond twice the limit, Zed answers with the outline.
@@ -139,11 +155,9 @@ function main(): void {
     if (lines <= MAX_LINES) {
       return;
     }
-    what = whole
-      ?`This file has ${lines} lines, more than ${MAX_LINES}, so it is not read whole.`
-      : `This window has ${lines} lines, more than ${MAX_LINES}.`;
+    reason = whole ? fileTooLarge(lines) : windowTooLarge(lines);
   }
-  process.stdout.write(JSON.stringify(deny(`${what} ${WHAT_TO_DO}`)));
+  process.stdout.write(JSON.stringify(deny(reason)));
 }
 
 try {

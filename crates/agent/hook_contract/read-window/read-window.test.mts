@@ -63,11 +63,38 @@ test('a whole read of a file of more than 120 lines is denied, with what to do i
   const cwd = project({ 'src/big.ts': 200 });
   const reason = denial(run(readFile(cwd, { path: zedPath(cwd, 'src/big.ts') })));
   assert.ok(reason, 'expected a denial');
-  assert.match(reason, /200 lines/);
-  assert.match(reason, /grep/);
-  assert.match(reason, /120 lines/);
-  assert.match(reason, /start_line/);
-  assert.match(reason, /end_line/);
+  // In the words of Zed's own answer for a large file (crates/agent/src/tools/read_file_tool.rs:522-530).
+  for (const phrase of [
+    'This file is too large to read all at once',
+    'it has 200 lines',
+    'at most 120 lines',
+    'IMPORTANT: Do NOT retry this call without line numbers',
+    'find the lines you need with grep first',
+    'calling this tool again with start_line and end_line parameters',
+    'NEXT STEPS:',
+    'call read_file with the same path plus start_line and end_line',
+    'use start_line: 100 and end_line: 150.',
+  ]) {
+    assert.ok(reason.includes(phrase), `missing « ${phrase} » in:\n${reason}`);
+  }
+});
+
+test('a window too large is denied in the same words', () => {
+  const cwd = project({ 'src/big.ts': 300 });
+  const reason = denial(run(readFile(cwd, { path: zedPath(cwd, 'src/big.ts'), start_line: 1, end_line: 200 })));
+  assert.ok(reason, 'expected a denial');
+  for (const phrase of [
+    'This window is too large to read at once',
+    'it covers 200 lines',
+    'at most 120 lines',
+    'IMPORTANT: Do NOT retry this call with the same window',
+    'find the lines you need with grep first',
+    'NEXT STEPS:',
+    'call read_file with the same path plus start_line and end_line',
+    'use start_line: 100 and end_line: 150.',
+  ]) {
+    assert.ok(reason.includes(phrase), `missing « ${phrase} » in:\n${reason}`);
+  }
 });
 
 test('a file of 120 lines or fewer is read whole', () => {
@@ -123,7 +150,7 @@ test('other tools are left alone', () => {
 test('a window with both bounds is decided on its size, as the model asked for it', () => {
   const cwd = project({ 'src/short.ts': 50 });
   const reason = denial(run(readFile(cwd, { path: zedPath(cwd, 'src/short.ts'), start_line: 1, end_line: 200 })));
-  assert.match(reason ?? '', /asks for 200 lines/);
+  assert.match(reason ?? '', /covers 200 lines/);
 });
 
 test('the hook adds less than 50 ms to node start-up on a file of 10 MB', () => {

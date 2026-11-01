@@ -27,9 +27,13 @@ Il faut node 24 ou plus, sans aucune dépendance.
   se mesure comme Zed la lit : de `start_line` à la fin du fichier, ou du début à `end_line`.
 - Pour compter les lignes, il lit le fichier par morceaux de 64 Kio, sans jamais le garder entier en
   mémoire. Sur un fichier de 10 Mo, il ajoute moins de 50 ms au démarrage de node (test).
-- Le refus revient au modèle comme résultat de l'outil. Il dit le nombre de lignes et quoi faire :
-  chercher d'abord (`grep`, ou un outil de recherche de symboles s'il en a un), puis lire une fenêtre
-  de 120 lignes au plus autour des lignes trouvées.
+- Le refus revient au modèle comme résultat de l'outil. Il reprend les mots et la structure de la
+  réponse de Zed pour un gros fichier (`crates/agent/src/tools/read_file_tool.rs:522-530`), pour que
+  le modèle ne lise qu'une seule façon de le dire : « This file is too large to read all at once… »,
+  « IMPORTANT: Do NOT retry this call without line numbers… », « NEXT STEPS: … ». Seul change ce
+  qui diffère : pas de plan ici, donc chercher d'abord les lignes avec `grep`, puis lire une
+  fenêtre de 120 lignes au plus. Une fenêtre trop grande reçoit le même texte, ouvert par « This
+  window is too large to read at once… ».
 - La limite est la constante `MAX_LINES`, en tête du script.
 
 ## Ce qu'il laisse passer
