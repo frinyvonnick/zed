@@ -21,8 +21,11 @@ Il faut node 24 ou plus, sans aucune dépendance.
 ## Ce qu'il décide
 
 - Il refuse un `read_file` sans `start_line` ni `end_line` sur un fichier de plus de 120 lignes.
-- Il refuse toute fenêtre de plus de 120 lignes. Une fenêtre à une seule borne se mesure comme Zed
-  la lit : de `start_line` à la fin du fichier, ou du début à `end_line`.
+- Il refuse toute fenêtre de plus de 120 lignes. Une fenêtre à deux bornes se juge sur ce que le
+  modèle demande (`end_line - start_line + 1`), sans ouvrir le fichier. Une fenêtre à une seule borne
+  se mesure comme Zed la lit : de `start_line` à la fin du fichier, ou du début à `end_line`.
+- Pour compter les lignes, il lit le fichier par morceaux de 64 Kio, sans jamais le garder entier en
+  mémoire. Sur un fichier de 10 Mo, il ajoute moins de 50 ms au démarrage de node (test).
 - Le refus revient au modèle comme résultat de l'outil. Il dit le nombre de lignes et quoi faire :
   chercher d'abord (`grep`, ou un outil de recherche de symboles s'il en a un), puis lire une fenêtre
   de 120 lignes au plus autour des lignes trouvées.

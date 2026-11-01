@@ -42,11 +42,24 @@ function resolve(file: string, cwd: string): string | undefined {
   });
 }
 
-function lineCount(text: string): number {
-  if (text === '') {
-    return 0;
+/** Lines of a file, read by chunks: the file is never held whole in memory. */
+function lineCount(file: string): number {
+  const chunk = Buffer.alloc(1 << 16);
+  const descriptor = fs.openSync(file, 'r');
+  try {
+    let newlines = 0;
+    let last = -1;
+    for (let read; (read = fs.readSync(descriptor, chunk, 0, chunk.length, null)) > 0;) {
+      for (let at = chunk.indexOf(10); at !== -1 && at < read; at = chunk.indexOf(10, at + 1)) {
+        newlines += 1;
+      }
+      last = chunk[read - 1];
+    }
+    // A last line without a newline is a line too.
+    return last === -1 ? 0 : newlines + (last === 10 ? 0 : 1);
+  } finally {
+    fs.closeSync(descriptor);
   }
-  return text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
 }
 
 /** Lines read_file returns, with its rules: start 1 and end of file by default, end at least start. */
@@ -85,15 +98,24 @@ function main(): void {
   if (found === undefined) {
     return;
   }
-  const total = lineCount(fs.readFileSync(found, 'utf8'));
   const { start_line: start, end_line: end } = input.tool_input;
-  const lines = windowLines(total, start, end);
-  if (lines <= MAX_LINES) {
-    return;
+  let what: string;
+  if (Number.isInteger(start) && Number.isInteger(end)) {
+    // Both bounds: decided on what the model asked for, without reading the file.
+    const asked = Math.max(end, start) - Math.max(start, 1) + 1;
+    if (asked <= MAX_LINES) {
+      return;
+    }
+    what = `This window asks for ${asked} lines, more than ${MAX_LINES}.`;
+  } else {
+    const lines = windowLines(lineCount(found), start, end);
+    if (lines <= MAX_LINES) {
+      return;
+    }
+    what = start == null && end == null
+      ? `This file has ${lines} lines, more than ${MAX_LINES}, so it is not read whole.`
+      : `This window has ${lines} lines, more than ${MAX_LINES}.`;
   }
-  const what = start == null && end == null
-    ? `This file has ${lines} lines, more than ${MAX_LINES}, so it is not read whole.`
-    : `This window has ${lines} lines, more than ${MAX_LINES}.`;
   process.stdout.write(JSON.stringify(deny(`${what} ${WHAT_TO_DO}`)));
 }
 

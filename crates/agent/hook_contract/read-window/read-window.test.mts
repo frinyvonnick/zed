@@ -120,6 +120,31 @@ test('other tools are left alone', () => {
   assert.deepEqual(run(input), {});
 });
 
+test('a window with both bounds is decided on its size, as the model asked for it', () => {
+  const cwd = project({ 'src/short.ts': 50 });
+  const reason = denial(run(readFile(cwd, { path: zedPath(cwd, 'src/short.ts'), start_line: 1, end_line: 200 })));
+  assert.match(reason ?? '', /asks for 200 lines/);
+});
+
+test('the hook adds less than 50 ms to node start-up on a file of 10 MB', () => {
+  const cwd = project({});
+  const line = 'const value = compute(1, 2, 3); // one line of a big file\n';
+  fs.writeFileSync(path.join(cwd, 'big.js'), line.repeat(Math.ceil(10_000_000 / line.length)));
+  const median = (input: object | string) => {
+    const times = Array.from({ length: 5 }, () => {
+      const start = performance.now();
+      run(input);
+      return performance.now() - start;
+    }).sort((a, b) => a - b);
+    return times[2];
+  };
+  // An unreadable input measures node start-up alone.
+  const startUp = median('not json');
+  const work = median(readFile(cwd, { path: zedPath(cwd, 'big.js') })) - startUp;
+  assert.ok(denial(run(readFile(cwd, { path: zedPath(cwd, 'big.js') }))));
+  assert.ok(work < 50, `${Math.round(work)} ms over a start-up of ${Math.round(startUp)} ms`);
+});
+
 test('an input it cannot read changes nothing', () => {
   assert.deepEqual(run('not json'), {});
 });
