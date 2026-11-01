@@ -11,9 +11,10 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const script = path.join(here, 'read-window.mts');
 
-function run(input: object | string): any {
+function run(input: object | string, data = fs.mkdtempSync(path.join(os.tmpdir(), 'read-window-data-'))): any {
   const result = spawnSync(process.execPath, [script], {
     input: typeof input === 'string' ? input : JSON.stringify(input),
+    env: { ...process.env, ZED_HOOK_DATA_DIR: data },
     encoding: 'utf8',
   });
   assert.equal(result.status, 0, result.stderr);
@@ -202,4 +203,40 @@ test('the outline limit counts characters as Zed holds them, with \\r\\n read as
 
 test('an input it cannot read changes nothing', () => {
   assert.deepEqual(run('not json'), {});
+});
+
+/** The lines of the firing log in `data`, or none when there is no log. */
+function firings(data: string): any[] {
+  const logs = fs.readdirSync(data).filter((name) => name.endsWith('.firings.jsonl'));
+  assert.ok(logs.length <= 1, logs.join(', '));
+  if (logs.length === 0) return [];
+  return fs.readFileSync(path.join(data, logs[0]), 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line));
+}
+
+test('each denial sent is logged with its kind, path, size and exact text; a call let through logs nothing', () => {
+  const cwd = project({ 'src/big.ts': 400, 'src/small.ts': 10 });
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), 'read-window-data-'));
+  run(readFile(cwd, { path: zedPath(cwd, 'src/small.ts') }), data);
+  assert.deepEqual(firings(data), []);
+  const whole = denial(run(readFile(cwd, { path: zedPath(cwd, 'src/big.ts') }), data));
+  const window = denial(run(readFile(cwd, { path: zedPath(cwd, 'src/big.ts'), start_line: 1, end_line: 350 }), data));
+  const lines = firings(data);
+  assert.equal(lines.length, 2);
+  assert.deepEqual(lines.map(({ at, ...rest }) => rest), [
+    { kind: 'whole-file', path: zedPath(cwd, 'src/big.ts'), lines: 400, text: whole },
+    { kind: 'window-too-large', path: zedPath(cwd, 'src/big.ts'), lines: 350, text: window },
+  ]);
+  for (const { at } of lines) assert.equal(new Date(at).toISOString(), at);
+});
+
+test('the log is kept per thread, by session_id when the input has no thread id', () => {
+  const cwd = project({ 'src/big.ts': 400 });
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), 'read-window-data-'));
+  const call = readFile(cwd, { path: zedPath(cwd, 'src/big.ts') }) as any;
+  run(call, data);
+  run({ ...call, zed: { ...call.zed, thread_id: 'thread-2' } }, data);
+  const { zed, ...withoutZed } = call;
+  run(withoutZed, data);
+  const logs = fs.readdirSync(data).filter((name) => name.endsWith('.firings.jsonl'));
+  assert.equal(logs.length, 3, logs.join(', '));
 });

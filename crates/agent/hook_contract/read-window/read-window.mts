@@ -14,7 +14,10 @@
 //   segment of `cwd`), or are absolute; the hook resolves both against `cwd`.
 // - A file it cannot find, an input it cannot read, or another tool gives no
 //   output at all: Zed runs the call as the model wrote it.
+// - Each denial sent adds one line to `<thread>.firings.jsonl` in ZED_HOOK_DATA_DIR.
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 /** Most lines one read_file may return. */
@@ -134,13 +137,16 @@ function main(): void {
   }
   const { start_line: start, end_line: end } = input.tool_input;
   let reason: string;
+  let kind: 'whole-file' | 'window-too-large';
+  let size: number;
   if (Number.isInteger(start) && Number.isInteger(end)) {
     // Both bounds: decided on what the model asked for, without reading the file.
-    const asked = Math.max(end, start) - Math.max(start, 1) + 1;
-    if (asked <= MAX_LINES) {
+    size = Math.max(end, start) - Math.max(start, 1) + 1;
+    if (size <= MAX_LINES) {
       return;
     }
-    reason = windowTooLarge(asked);
+    kind = 'window-too-large';
+    reason = windowTooLarge(size);
   } else {
     const whole = start == null && end == null;
     // At most one byte in two is the \r of a \r\n: beyond twice the limit, Zed answers with the outline.
@@ -151,13 +157,35 @@ function main(): void {
     if (whole && measured.length > AUTO_OUTLINE_SIZE) {
       return;
     }
-    const lines = windowLines(measured.lines, start, end);
-    if (lines <= MAX_LINES) {
+    size = windowLines(measured.lines, start, end);
+    if (size <= MAX_LINES) {
       return;
     }
-    reason = whole ? fileTooLarge(lines) : windowTooLarge(lines);
+    kind = whole ? 'whole-file' : 'window-too-large';
+    reason = whole ? fileTooLarge(size) : windowTooLarge(size);
   }
   process.stdout.write(JSON.stringify(deny(reason)));
+  logFiring(input, { at: new Date().toISOString(), kind, path: file, lines: size, text: reason });
+}
+
+/**
+ * Appends one line per denial sent to `<thread>.firings.jsonl` in ZED_HOOK_DATA_DIR, the proof that
+ * the hook acted. The thread is `zed.thread_id`, or `session_id` without it. A failed append is
+ * reported on stderr and never changes the decision.
+ */
+function logFiring(input: any, line: object): void {
+  const thread: unknown = input.zed?.thread_id ?? input.session_id;
+  if (typeof thread !== 'string' || thread === '') {
+    return;
+  }
+  try {
+    const dir = process.env.ZED_HOOK_DATA_DIR ?? path.join(os.tmpdir(), 'zed-read-window');
+    fs.mkdirSync(dir, { recursive: true });
+    const name = `${createHash('sha256').update(thread).digest('hex').slice(0, 32)}.firings.jsonl`;
+    fs.appendFileSync(path.join(dir, name), `${JSON.stringify(line)}\n`);
+  } catch (error) {
+    process.stderr.write(`read-window: could not log its denial: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
 }
 
 try {

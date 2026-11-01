@@ -57,6 +57,15 @@ Zed donne souvent le chemin précédé du nom du dossier racine du projet
 `cwd`. Il ne connaît que la première racine du projet : un fichier d'une autre racine n'est pas
 trouvé, donc pas refusé.
 
+## Prouver qu'il agit
+
+Chaque refus réellement renvoyé ajoute une ligne JSON à `<ZED_HOOK_DATA_DIR>/<fil>.firings.jsonl`.
+Zed donne à chaque crochet son propre dossier de données. `<fil>` est le début du hachage SHA-256 de
+`zed.thread_id`, ou de `session_id` sans lui, comme grep-court et write-reminder. Chaque ligne porte
+`at` (heure ISO), `kind` (`whole-file` ou `window-too-large`), `path` (le chemin donné par le
+modèle), `lines` (taille du fichier ou de la fenêtre) et `text` (le motif exact). Rien n'y est
+écrit quand le crochet laisse passer.
+
 ## Tests
 
 `node --test read-window.test.mts` lance le vrai script, comme Zed, avec son entrée sur stdin.
