@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /** Most lines one read_file may return. */
-const MAX_LINES = 120;
+const MAX_LINES = 300;
 
 /**
  * Beyond this size, a read_file without a window returns the file's outline instead of its
