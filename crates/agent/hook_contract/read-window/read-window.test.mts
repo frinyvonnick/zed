@@ -140,9 +140,37 @@ test('the hook adds less than 50 ms to node start-up on a file of 10 MB', () => 
   };
   // An unreadable input measures node start-up alone.
   const startUp = median('not json');
-  const work = median(readFile(cwd, { path: zedPath(cwd, 'big.js') })) - startUp;
-  assert.ok(denial(run(readFile(cwd, { path: zedPath(cwd, 'big.js') }))));
+  // A window with one bound makes the hook count every line of the file.
+  const call = readFile(cwd, { path: zedPath(cwd, 'big.js'), start_line: 10 });
+  const work = median(call) - startUp;
+  assert.ok(denial(run(call)));
   assert.ok(work < 50, `${Math.round(work)} ms over a start-up of ${Math.round(startUp)} ms`);
+});
+
+/** A file of `bytes` bytes on disk, in lines of 64 characters, with this line ending. */
+function sized(cwd: string, file: string, bytes: number, ending = '\n'): void {
+  const line = `${'x'.repeat(64 - ending.length)}${ending}`;
+  const text = line.repeat(Math.floor(bytes / line.length));
+  fs.writeFileSync(path.join(cwd, file), text + 'y'.repeat(bytes - text.length));
+}
+
+test('a file over 16384 characters is read whole: Zed answers with its outline', () => {
+  // crates/agent/src/outline.rs:10, AUTO_OUTLINE_SIZE = 16384, compared with `>` at line 35.
+  const cwd = project({});
+  sized(cwd, 'at-limit.ts', 16384);
+  sized(cwd, 'over-limit.ts', 16385);
+  assert.ok(denial(run(readFile(cwd, { path: zedPath(cwd, 'at-limit.ts') }))));
+  assert.deepEqual(run(readFile(cwd, { path: zedPath(cwd, 'over-limit.ts') })), {});
+  // A window still counts: the outline is only for a read without one.
+  assert.ok(denial(run(readFile(cwd, { path: zedPath(cwd, 'over-limit.ts'), start_line: 1, end_line: 200 }))));
+  assert.ok(denial(run(readFile(cwd, { path: zedPath(cwd, 'over-limit.ts'), start_line: 10 }))));
+});
+
+test('the outline limit counts characters as Zed holds them, with \\r\\n read as \\n', () => {
+  // 16 500 bytes on disk, but 16 243 in the buffer once Zed has turned each \r\n into \n.
+  const cwd = project({});
+  sized(cwd, 'windows.ts', 16500, '\r\n');
+  assert.ok(denial(run(readFile(cwd, { path: zedPath(cwd, 'windows.ts') }))));
 });
 
 test('an input it cannot read changes nothing', () => {

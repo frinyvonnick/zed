@@ -7,6 +7,8 @@
 // Declare it as a command hook on PreToolUse, matcher read_file:
 //   node read-window.mts
 //
+// - A file over AUTO_OUTLINE_SIZE read without a window passes: Zed answers
+//   with its outline (symbols and their lines, no content), a cheap way to aim.
 // - Skills are read whole: a path under .agents/skills or .claude/skills passes.
 // - Zed paths often start with the name of the project root folder (the last
 //   segment of `cwd`), or are absolute; the hook resolves both against `cwd`.
@@ -17,6 +19,13 @@ import path from 'node:path';
 
 /** Most lines one read_file may return. */
 const MAX_LINES = 120;
+
+/**
+ * Beyond this size, a read_file without a window returns the file's outline instead of its
+ * content: AUTO_OUTLINE_SIZE in crates/agent/src/outline.rs:10, compared with `>` to the
+ * length of the buffer text (outline.rs:33-35), where each \r\n is a single \n.
+ */
+const AUTO_OUTLINE_SIZE = 16384;
 
 /** Folders whose files are read whole. */
 const SKILL_FOLDERS = ['.agents/skills', '.claude/skills'];
@@ -42,21 +51,30 @@ function resolve(file: string, cwd: string): string | undefined {
   });
 }
 
-/** Lines of a file, read by chunks: the file is never held whole in memory. */
-function lineCount(file: string): number {
+/**
+ * Lines of a file and its length as Zed holds it (each \r\n a single \n), read by chunks:
+ * the file is never held whole in memory.
+ */
+function measure(file: string): { lines: number; length: number } {
   const chunk = Buffer.alloc(1 << 16);
   const descriptor = fs.openSync(file, 'r');
   try {
+    let bytes = 0;
     let newlines = 0;
+    let crlf = 0;
     let last = -1;
     for (let read; (read = fs.readSync(descriptor, chunk, 0, chunk.length, null)) > 0;) {
       for (let at = chunk.indexOf(10); at !== -1 && at < read; at = chunk.indexOf(10, at + 1)) {
         newlines += 1;
+        if ((at > 0 ? chunk[at - 1] : last) === 13) {
+          crlf += 1;
+        }
       }
+      bytes += read;
       last = chunk[read - 1];
     }
     // A last line without a newline is a line too.
-    return last === -1 ? 0 : newlines + (last === 10 ? 0 : 1);
+    return { lines: last === -1 ? 0 : newlines + (last === 10 ? 0 : 1), length: bytes - crlf };
   } finally {
     fs.closeSync(descriptor);
   }
@@ -108,12 +126,21 @@ function main(): void {
     }
     what = `This window asks for ${asked} lines, more than ${MAX_LINES}.`;
   } else {
-    const lines = windowLines(lineCount(found), start, end);
+    const whole = start == null && end == null;
+    // At most one byte in two is the \r of a \r\n: beyond twice the limit, Zed answers with the outline.
+    if (whole && fs.statSync(found).size > 2 * AUTO_OUTLINE_SIZE) {
+      return;
+    }
+    const measured = measure(found);
+    if (whole && measured.length > AUTO_OUTLINE_SIZE) {
+      return;
+    }
+    const lines = windowLines(measured.lines, start, end);
     if (lines <= MAX_LINES) {
       return;
     }
-    what = start == null && end == null
-      ? `This file has ${lines} lines, more than ${MAX_LINES}, so it is not read whole.`
+    what = whole
+      ?`This file has ${lines} lines, more than ${MAX_LINES}, so it is not read whole.`
       : `This window has ${lines} lines, more than ${MAX_LINES}.`;
   }
   process.stdout.write(JSON.stringify(deny(`${what} ${WHAT_TO_DO}`)));
