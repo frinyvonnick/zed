@@ -113,9 +113,11 @@ pub fn into_open_ai(
                         if let Some(reasoning) = current_reasoning.take() {
                             if let Some(crate::RequestMessage::Assistant {
                                 reasoning_content,
+                                reasoning: reasoning_field,
                                 ..
                             }) = messages.last_mut()
                             {
+                                *reasoning_field = Some(reasoning.clone());
                                 *reasoning_content = Some(reasoning);
                             }
                         }
@@ -164,10 +166,12 @@ pub fn into_open_ai(
                     {
                         tool_calls.push(tool_call);
                     } else {
+                        let reasoning = current_reasoning.take();
                         messages.push(crate::RequestMessage::Assistant {
                             content: None,
                             tool_calls: vec![tool_call],
-                            reasoning_content: current_reasoning.take(),
+                            reasoning: reasoning.clone(),
+                            reasoning_content: reasoning,
                             reasoning_details: reasoning_details.clone(),
                         });
                     }
@@ -739,6 +743,7 @@ fn add_message_content_part(
                     content: Some(crate::MessageContent::from(vec![new_part])),
                     tool_calls: Vec::new(),
                     reasoning_content: None,
+                    reasoning: None,
                     reasoning_details,
                 },
                 Role::System => crate::RequestMessage::System {
@@ -4258,6 +4263,7 @@ mod tests {
                     "content": "Searching now.",
                     "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search", "arguments": tool_arguments, "thought_signature": "thought-signature"}}],
                     "reasoning_content": "I should search",
+                    "reasoning": "I should search",
                     "reasoning_details": [{
                         "id": "reasoning-1",
                         "type": "reasoning.encrypted",
@@ -4294,6 +4300,69 @@ mod tests {
                 {"role": "tool", "content": "result", "tool_call_id": "call-1"}
             ])
         );
+    }
+
+    #[test]
+    fn into_open_ai_replays_reasoning_in_both_reasoning_fields() {
+        // vLLM only renders past reasoning from the `reasoning` field and drops
+        // `reasoning_content`; DeepSeek-style providers read `reasoning_content`.
+        // With interleaved reasoning, send the same text in both.
+        let tool_input = json!({"query": "foo"});
+        let tool_arguments = serde_json::to_string(&tool_input).unwrap();
+        let request = LanguageModelRequest {
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("search for something".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![
+                        MessageContent::Thinking {
+                            text: "I should search".into(),
+                            signature: None,
+                        },
+                        MessageContent::ToolUse(LanguageModelToolUse {
+                            id: LanguageModelToolUseId::from("call-1"),
+                            name: Arc::from("search"),
+                            raw_input: tool_arguments.clone(),
+                            input: LanguageModelToolUseInput::Json(tool_input),
+                            is_input_complete: true,
+                            thought_signature: None,
+                        }),
+                    ],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let assistant_message = |interleaved_reasoning: bool| {
+            let result = into_open_ai(
+                request.clone(),
+                "model",
+                false,
+                false,
+                None,
+                ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+                None,
+                interleaved_reasoning,
+            )
+            .unwrap();
+            serde_json::to_value(&result).unwrap()["messages"][1].clone()
+        };
+
+        let interleaved = assistant_message(true);
+        assert_eq!(interleaved["reasoning_content"], json!("I should search"));
+        assert_eq!(interleaved["reasoning"], json!("I should search"));
+        assert_eq!(interleaved["tool_calls"][0]["id"], json!("call-1"));
+
+        let not_interleaved = assistant_message(false);
+        assert!(not_interleaved.get("reasoning_content").is_none());
+        assert!(not_interleaved.get("reasoning").is_none());
+        assert_eq!(not_interleaved["tool_calls"][0]["id"], json!("call-1"));
     }
 
     #[test]
