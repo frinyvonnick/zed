@@ -247,6 +247,29 @@ test('each compaction appends the initial goal word for word, then the instructi
   }
 });
 
+test('the goal of a slash command is the text typed after the skill it loads', () => {
+  // Zed sends /implement-story as one user message: the skill envelope, then what the user typed
+  // (crates/agent/src/agent.rs:2318-2324, envelope from crates/agent/src/tools/skill_tool.rs:63-76).
+  const skill = '<skill_content name="implement-story">\n# Implement a story\nRead the story, then write its test.\n</skill_content>\n';
+  const typed = 'epics/e1/stories/s1.md';
+  const reminder = '<system-reminder>\nToday is 2026-11-01.\n</system-reminder>';
+  for (const content of [
+    [{ type: 'text', text: `${skill}\n  ${typed}  \n` }],
+    [{ type: 'text', text: skill }, { type: 'text', text: typed }],
+    [{ type: 'text', text: `${reminder}\n${skill}${typed}` }],
+  ]) {
+    const thread = new Thread(`slash-${callId++}`);
+    thread.request([{ role: 'user', content }]);
+    const text = thread.compact() ?? '';
+    assert.ok(text.includes(`word for word:\n\n${typed}\n\n${AFTER_COMPACTION}`), text);
+    assert.doesNotMatch(text, /skill_content|Implement a story|system-reminder/);
+  }
+  // A message made only of a skill keeps it whole: there is nothing else to keep.
+  const only = new Thread('skill-only');
+  only.request([userText(skill)]);
+  assert.ok((only.compact() ?? '').includes(skill), 'the whole message is kept');
+});
+
 test('a compaction without a known goal still appends the instruction to write', () => {
   assert.equal(new Thread('unknown-thread').compact(), AFTER_COMPACTION);
 });

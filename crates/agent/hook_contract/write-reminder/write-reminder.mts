@@ -103,7 +103,14 @@ function saveState(dir: string, file: string, state: State): void {
   }
 }
 
-/** The text of the first user message that has some, or undefined. */
+/**
+ * Blocks Zed adds to a user message: a slash command puts the skill it loads before what the user
+ * typed (crates/agent/src/agent.rs:2318-2324), in the envelope of skill_tool.rs:63-76, whose body
+ * cannot hold the closing tag (skill_tool.rs:30-31). System reminders are dropped too.
+ */
+const ENVELOPES = /<(skill_content|system-reminder)\b[^>]*>[\s\S]*?<\/\1\s*>/g;
+
+/** The first user message that has some text, without the blocks Zed adds; the whole text if nothing else is left. */
 function firstUserText(messages: any[]): string | undefined {
   for (const message of messages) {
     if (message?.role !== 'user') {
@@ -111,7 +118,9 @@ function firstUserText(messages: any[]): string | undefined {
     }
     const texts = (message.content ?? []).filter((part: any) => part?.type === 'text' && typeof part.text === 'string');
     if (texts.length > 0) {
-      return texts.map((part: any) => part.text).join('\n\n');
+      const whole = texts.map((part: any) => part.text).join('\n\n');
+      const typed = whole.replace(ENVELOPES, '').trim();
+      return typed === '' ? whole : typed;
     }
   }
   return undefined;
