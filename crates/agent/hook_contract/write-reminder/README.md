@@ -73,8 +73,19 @@ utilisateur, le nombre de requêtes depuis la dernière écriture, la dernière 
 dernier rappel. Jamais l'historique. Zed rappelle `BeforeModel` quand il relance une requête, sans
 nouveau message : le crochet ne la compte pas une deuxième fois et lui redonne le même rappel.
 
-Si le crochet est branché au milieu d'un fil déjà compacté, le premier message qu'il voit est le
-résumé : c'est lui qu'il gardera comme but.
+Le but est ce premier message privé des blocs que Zed y ajoute (`<skill_content>` d'une commande
+slash, `<system-reminder>`), espaces de tête et de fin retirés ; s'il ne reste rien, le message
+entier. Si le crochet est branché au milieu d'un fil déjà compacté, le premier message qu'il voit
+est le résumé : c'est lui qu'il gardera comme but.
+
+## Prouver qu'il se déclenche
+
+Chaque message réellement envoyé au modèle ajoute une ligne JSON à
+`<ZED_HOOK_DATA_DIR>/<fil>.firings.jsonl` (même nom haché que le fichier d'état) : `at` (heure ISO),
+`kind` (`write-nudge`, `context-level` ou `goal-after-compaction`), `requestsSinceWrite`,
+`contextTokens` et `percent` (`null` sans mesure), et `text`, le texte exact envoyé. Rien n'y est
+écrit quand le crochet ne renvoie rien. Pour une compaction, `contextTokens` est la dernière mesure
+avant elle.
 
 ## Tests
 

@@ -104,6 +104,28 @@ function saveState(dir: string, file: string, state: State): void {
 }
 
 /**
+ * Appends one line per message sent to the model to `<thread>.firings.jsonl`, the proof that a
+ * reminder fired. A failed append is reported on stderr and never stops the reminder.
+ */
+function logFirings(file: string, state: State, texts: string[], kind?: string): void {
+  const tokens = state.contextTokens ?? null;
+  const lines = texts.map((text) => JSON.stringify({
+    at: new Date().toISOString(),
+    kind: kind ?? (text.startsWith('You have made ') ? 'write-nudge' : 'context-level'),
+    requestsSinceWrite: state.requests,
+    contextTokens: tokens,
+    percent: tokens === null ? null : Math.round((tokens / CONTEXT_WINDOW) * 100),
+    text,
+  }));
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file.replace(/\.json$/, '.firings.jsonl'), lines.map((line) => `${line}\n`).join(''));
+  } catch (error) {
+    process.stderr.write(`write-reminder: could not log its reminders: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
+
+/**
  * Blocks Zed adds to a user message: a slash command puts the skill it loads before what the user
  * typed (crates/agent/src/agent.rs:2318-2324), in the envelope of skill_tool.rs:63-76, whose body
  * cannot hold the closing tag (skill_tool.rs:30-31). System reminders are dropped too.
@@ -180,11 +202,14 @@ function main(): void {
     return;
   }
   if (event === 'PostCompact') {
+    const passage = postCompact(state);
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'PostCompact', zed: { append_to_summary: passage } },
+    }));
+    // Logged with the last measure before the compaction, which is then forgotten.
+    logFirings(file, state, [passage], 'goal-after-compaction');
     state.contextTokens = undefined;
     saveState(dir, file, state);
-    process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'PostCompact', zed: { append_to_summary: postCompact(state) } },
-    }));
     return;
   }
   const reminders = beforeModel(input, state);
@@ -192,6 +217,7 @@ function main(): void {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'BeforeModel', ephemeral_messages: reminders },
     }));
+    logFirings(file, state, reminders);
   }
   // Saved after the output, so that a failed save loses only the count, never this reminder.
   saveState(dir, file, state);

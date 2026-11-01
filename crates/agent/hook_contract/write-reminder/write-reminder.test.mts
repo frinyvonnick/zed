@@ -270,6 +270,57 @@ test('the goal of a slash command is the text typed after the skill it loads', (
   assert.ok((only.compact() ?? '').includes(skill), 'the whole message is kept');
 });
 
+/** The lines of the firing log of this thread's data folder, or none when there is no log. */
+function firings(thread: Thread): any[] {
+  const logs = fs.readdirSync(thread.data).filter((name) => name.endsWith('.firings.jsonl'));
+  assert.ok(logs.length <= 1, logs.join(', '));
+  if (logs.length === 0) return [];
+  return fs.readFileSync(path.join(thread.data, logs[0]), 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line));
+}
+
+function assertFiring(line: any, kind: string, requestsSinceWrite: number, contextTokens: number | null, percent: number | null, text: string): void {
+  assert.equal(line.kind, kind);
+  assert.equal(line.requestsSinceWrite, requestsSinceWrite);
+  assert.equal(line.contextTokens, contextTokens);
+  assert.equal(line.percent, percent);
+  assert.equal(line.text, text);
+  assert.ok(!Number.isNaN(Date.parse(line.at)) && new Date(line.at).toISOString() === line.at, line.at);
+}
+
+test('each reminder sent is logged with its kind, its numbers and its exact text', () => {
+  const thread = new Thread();
+  thread.reads(7);
+  assert.deepEqual(firings(thread), [], 'nothing is logged while nothing is sent');
+  thread.respond(usage(40000, 1000));
+  const [[sent]] = thread.reads(1);
+  const lines = firings(thread);
+  assert.equal(lines.length, 1);
+  assertFiring(lines[0], 'write-nudge', 8, 41000, 33, sent);
+});
+
+test('beyond 70 %, every request logs a context-level line', () => {
+  const thread = new Thread();
+  thread.reads(2);
+  thread.respond(usage(89000, 1000));
+  const sent = thread.reads(3).map(([text]) => text);
+  const lines = firings(thread);
+  assert.equal(lines.length, 3);
+  lines.forEach((line, index) => assertFiring(line, 'context-level', index + 3, 90000, 73, sent[index]));
+});
+
+test('a compaction logs the goal it appends, without the skill of a slash command', () => {
+  const thread = new Thread();
+  const skill = '<skill_content name="implement-story">\n# Implement a story\n</skill_content>\n';
+  thread.request([{ role: 'user', content: [{ type: 'text', text: `${skill}epics/e1/stories/s1.md` }] }]);
+  thread.respond(usage(100000, 1000));
+  const appended = thread.compact();
+  const lines = firings(thread);
+  assert.equal(lines.length, 1);
+  assertFiring(lines[0], 'goal-after-compaction', 1, 101000, 82, appended!);
+  assert.doesNotMatch(lines[0].text, /skill_content/);
+  assert.match(lines[0].text, /epics\/e1\/stories\/s1\.md/);
+});
+
 test('a compaction without a known goal still appends the instruction to write', () => {
   assert.equal(new Thread('unknown-thread').compact(), AFTER_COMPACTION);
 });
