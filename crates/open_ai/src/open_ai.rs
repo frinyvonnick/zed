@@ -810,6 +810,10 @@ pub enum RequestMessage {
         tool_calls: Vec<ToolCall>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
+        /// Same text as `reasoning_content`. vLLM only replays past reasoning
+        /// from this field, while DeepSeek-style providers read `reasoning_content`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
         /// Provider-defined reasoning metadata required for replay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_details: Option<std::sync::Arc<Value>>,
