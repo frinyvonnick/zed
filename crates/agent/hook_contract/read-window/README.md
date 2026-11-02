@@ -20,9 +20,9 @@ Il faut node 24 ou plus, sans aucune dépendance.
 
 ## Ce qu'il décide
 
-- Il refuse un `read_file` sans `start_line` ni `end_line` sur un fichier de plus de 300 lignes et
+- Il refuse un `read_file` sans `start_line` ni `end_line` sur un fichier de plus de 120 lignes et
   de 16 384 caractères ou moins.
-- Il refuse toute fenêtre de plus de 300 lignes. Une fenêtre à deux bornes se juge sur ce que le
+- Il refuse toute fenêtre de plus de 120 lignes. Une fenêtre à deux bornes se juge sur ce que le
   modèle demande (`end_line - start_line + 1`), sans ouvrir le fichier. Une fenêtre à une seule borne
   se mesure comme Zed la lit : de `start_line` à la fin du fichier, ou du début à `end_line`.
 - Pour compter les lignes, il lit le fichier par morceaux de 64 Kio, sans jamais le garder entier en
@@ -32,13 +32,13 @@ Il faut node 24 ou plus, sans aucune dépendance.
   le modèle ne lise qu'une seule façon de le dire : « This file is too large to read all at once… »,
   « IMPORTANT: Do NOT retry this call without line numbers… », « NEXT STEPS: … ». Seul change ce
   qui diffère : pas de plan ici, donc chercher d'abord les lignes avec `grep`, puis lire une
-  fenêtre de 300 lignes au plus. Une fenêtre trop grande reçoit le même texte, ouvert par « This
+  fenêtre de 120 lignes au plus. Une fenêtre trop grande reçoit le même texte, ouvert par « This
   window is too large to read at once… ».
 - La limite est la constante `MAX_LINES`, en tête du script.
 
 ## Ce qu'il laisse passer
 
-- Un fichier de 300 lignes ou moins, lu en entier (un plan, une story, un petit fichier).
+- Un fichier de 120 lignes ou moins, lu en entier (un plan, une story, un petit fichier).
 - Un fichier de plus de 16 384 caractères lu sans fenêtre : Zed n'en renvoie pas le contenu mais le
   plan (ses symboles et leurs lignes), ce qui aide à viser la fenêtre suivante. La limite est
   `AUTO_OUTLINE_SIZE` de Zed (`crates/agent/src/outline.rs:10`), comparée par `>` à la longueur du

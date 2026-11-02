@@ -60,7 +60,7 @@ function denial(output: any): string | undefined {
   return specific.permissionDecisionReason;
 }
 
-test('a whole read of a file of more than 300 lines is denied, with what to do instead', () => {
+test('a whole read of a file of more than 120 lines is denied, with what to do instead', () => {
   const cwd = project({ 'src/big.ts': 400 });
   const reason = denial(run(readFile(cwd, { path: zedPath(cwd, 'src/big.ts') })));
   assert.ok(reason, 'expected a denial');
@@ -68,7 +68,7 @@ test('a whole read of a file of more than 300 lines is denied, with what to do i
   for (const phrase of [
     'This file is too large to read all at once',
     'it has 400 lines',
-    'at most 300 lines',
+    'at most 120 lines',
     'IMPORTANT: Do NOT retry this call without line numbers',
     'find the lines you need with grep first',
     'calling this tool again with start_line and end_line parameters',
@@ -87,7 +87,7 @@ test('a window too large is denied in the same words', () => {
   for (const phrase of [
     'This window is too large to read at once',
     'it covers 400 lines',
-    'at most 300 lines',
+    'at most 120 lines',
     'IMPORTANT: Do NOT retry this call with the same window',
     'find the lines you need with grep first',
     'NEXT STEPS:',
@@ -98,8 +98,8 @@ test('a window too large is denied in the same words', () => {
   }
 });
 
-test('a file of 300 lines or fewer is read whole', () => {
-  const cwd = project({ 'docs/story.md': 300, 'plan.md': 3 });
+test('a file of 120 lines or fewer is read whole', () => {
+  const cwd = project({ 'docs/story.md': 120, 'plan.md': 3 });
   assert.deepEqual(run(readFile(cwd, { path: zedPath(cwd, 'docs/story.md') })), {});
   assert.deepEqual(run(readFile(cwd, { path: zedPath(cwd, 'plan.md') })), {});
 });
@@ -110,24 +110,25 @@ test('a skill is read whole, whatever its length', () => {
   assert.deepEqual(run(readFile(cwd, { path: path.join(cwd, '.claude/skills/tdd/reference.md') })), {});
 });
 
-test('a window of more than 300 lines is denied, one of 300 lines passes', () => {
+test('a window of more than 120 lines is denied, one of 120 lines passes', () => {
   const cwd = project({ 'src/big.ts': 600 });
   const file = zedPath(cwd, 'src/big.ts');
   const reason = denial(run(readFile(cwd, { path: file, start_line: 1, end_line: 400 })));
   assert.ok(reason, 'expected a denial');
   assert.match(reason, /400 lines/);
-  assert.deepEqual(run(readFile(cwd, { path: file, start_line: 50, end_line: 349 })), {});
+  assert.ok(denial(run(readFile(cwd, { path: file, start_line: 50, end_line: 170 }))));
+  assert.deepEqual(run(readFile(cwd, { path: file, start_line: 50, end_line: 169 })), {});
 });
 
 test('a window with one bound only is measured against the file', () => {
   const cwd = project({ 'src/big.ts': 500 });
   const file = zedPath(cwd, 'src/big.ts');
-  // From line 300 to the end: 201 lines.
-  assert.deepEqual(run(readFile(cwd, { path: file, start_line: 300 })), {});
+  // From line 381 to the end: 120 lines.
+  assert.deepEqual(run(readFile(cwd, { path: file, start_line: 381 })), {});
   // From line 10 to the end: 491 lines.
   assert.ok(denial(run(readFile(cwd, { path: file, start_line: 10 }))));
-  // From the start to line 330: 330 lines.
-  assert.ok(denial(run(readFile(cwd, { path: file, end_line: 330 }))));
+  // From the start to line 121: 121 lines.
+  assert.ok(denial(run(readFile(cwd, { path: file, end_line: 121 }))));
 });
 
 test('a path prefixed with the root folder name, or absolute, is found', () => {
