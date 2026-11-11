@@ -56,7 +56,7 @@ test('the prefix with its arguments runs as it is', () => {
 
 test('a chained command that holds the prefix is refused, with the exact message', () => {
   const text = reason(run(terminal(`git add -A && ${PREFIX} --only hooks`)));
-  assert.equal(text, `This command must run alone to leave the sandbox: run exactly \`${PREFIX} …\` with no \`&&\`, \`;\`, pipe or redirection. Run any other step (git add, reading the output) as a separate command. Inside the sandbox node cannot start (error 0xC0000142).`);
+  assert.equal(text, `This command must run alone to leave the sandbox: run exactly \`${PREFIX} …\` with no \`&&\`, \`;\`, pipe or redirection. Run any other step (git add, reading the output) as a separate command. Inside the sandbox this test command fails with error 0xC0000142, even though other node commands run there.`);
 });
 
 test('a redirected command that holds the prefix is refused', () => {

@@ -1,7 +1,7 @@
 // Command-alone hook for Zed. In the eval bench (MXC), a few commands may leave the sandbox, by exact
 // prefix (list in ZED_EVAL_MXC_UNSANDBOXED, `;`-separated). Zed lets one out only when it is just that
 // prefix and its arguments. Composed (`git add … && <prefix>`, or `<prefix> > f.log`), it stays inside the
-// sandbox, where node cannot start (error 0xC0000142), and nothing tells the model why: on 11/11 (run
+// sandbox, where it fails with error 0xC0000142 (other node commands do run there, 11/11 RDSO), and nothing tells the model why: on 11/11 (run
 // N11111529-RDPD-a, requests 36 and 44) the agent hunted an antivirus for 18 requests.
 // On PreToolUse, this hook refuses a terminal command that holds such a prefix without being reduced to
 // it, and says what to do. Any other command runs as written. The sandbox list is never widened.
@@ -68,7 +68,7 @@ function main(): void {
   process.stdout.write(JSON.stringify(deny(
     `This command must run alone to leave the sandbox: run exactly \`${held} …\` with no \`&&\`, \`;\`, pipe or redirection. `
     + 'Run any other step (git add, reading the output) as a separate command. '
-    + 'Inside the sandbox node cannot start (error 0xC0000142).',
+    + 'Inside the sandbox this test command fails with error 0xC0000142, even though other node commands run there.',
   )));
 }
 
