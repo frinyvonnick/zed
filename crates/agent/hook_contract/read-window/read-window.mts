@@ -141,8 +141,9 @@ function main(): void {
   let size: number;
   if (Number.isInteger(start) && Number.isInteger(end)) {
     // Both bounds: decided on what the model asked for, without reading the file.
+    // The denial says « at most 120 lines apart »: end - start <= 120, so 121 lines with both bounds counted.
     size = Math.max(end, start) - Math.max(start, 1) + 1;
-    if (size <= MAX_LINES) {
+    if (size <= MAX_LINES + 1) {
       return;
     }
     kind = 'window-too-large';

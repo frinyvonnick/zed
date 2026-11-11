@@ -110,14 +110,15 @@ test('a skill is read whole, whatever its length', () => {
   assert.deepEqual(run(readFile(cwd, { path: path.join(cwd, '.claude/skills/tdd/reference.md') })), {});
 });
 
-test('a window of more than 120 lines is denied, one of 120 lines passes', () => {
+test('a window whose bounds are at most 120 lines apart passes, as the denial says', () => {
   const cwd = project({ 'src/big.ts': 600 });
   const file = zedPath(cwd, 'src/big.ts');
   const reason = denial(run(readFile(cwd, { path: file, start_line: 1, end_line: 400 })));
   assert.ok(reason, 'expected a denial');
   assert.match(reason, /400 lines/);
-  assert.ok(denial(run(readFile(cwd, { path: file, start_line: 50, end_line: 170 }))));
-  assert.deepEqual(run(readFile(cwd, { path: file, start_line: 50, end_line: 169 })), {});
+  assert.ok(denial(run(readFile(cwd, { path: file, start_line: 50, end_line: 171 }))));
+  assert.deepEqual(run(readFile(cwd, { path: file, start_line: 50, end_line: 170 })), {});
+  assert.deepEqual(run(readFile(cwd, { path: file, start_line: 120, end_line: 240 })), {});
 });
 
 test('a window with one bound only is measured against the file', () => {
